@@ -7,13 +7,21 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ServerState struct {
 	mutex  sync.RWMutex
-	values map[string]string
+	values map[string]ValueEntry
+}
+
+type ValueEntry struct {
+	key    string
+	value  string
+	expiry *time.Time
 }
 
 func main() {
@@ -22,7 +30,7 @@ func main() {
 
 	state := ServerState{
 		mutex:  sync.RWMutex{},
-		values: map[string]string{},
+		values: map[string]ValueEntry{},
 	}
 
 	// Bind to port
@@ -106,18 +114,44 @@ func handleConnection(conn net.Conn, state *ServerState) {
 				continue
 			}
 
-			// Format as Bulk String and return response.
 			conn.Write([]byte(EncodeBulkString(rawCommand[1])))
 
 		case "SET":
-			if len(rawCommand) != 3 {
+			if len(rawCommand) < 3 {
 				log.Printf("[%s] Malformed SET request: %#v", addr, rawCommand)
 				conn.Write([]byte(EncodeError("Malformed request.")))
 				continue
 			}
 
+			value := ValueEntry{
+				key:    rawCommand[1],
+				value:  rawCommand[2],
+				expiry: nil,
+			}
+
+			if len(rawCommand) >= 5 {
+				// TODO: Proper handling of arguments checking
+				expiry, err := strconv.Atoi(rawCommand[4])
+
+				if err != nil {
+					log.Printf("[%s] Malformed SET request: %#v", addr, rawCommand)
+					conn.Write([]byte(EncodeError("Malformed request.")))
+					continue
+				}
+
+				if strings.ToUpper(rawCommand[3]) == "PX" {
+					t := time.Now().Add(time.Duration(expiry) * time.Millisecond)
+					value.expiry = &t
+				} else if strings.ToUpper(rawCommand[3]) == "EX" {
+					t := time.Now().Add(time.Duration(expiry) * time.Second)
+					value.expiry = &t
+				}
+
+				// TODO: Send to the Reaper
+			}
+
 			state.mutex.Lock()
-			state.values[rawCommand[1]] = rawCommand[2]
+			state.values[value.key] = value
 			state.mutex.Unlock()
 
 			conn.Write([]byte(EncodeString("OK")))
@@ -133,11 +167,12 @@ func handleConnection(conn net.Conn, state *ServerState) {
 			value, exists := state.values[rawCommand[1]]
 			state.mutex.RUnlock()
 
-			if exists {
-				conn.Write([]byte(EncodeBulkString(value)))
+			if exists && (value.expiry == nil || value.expiry.After(time.Now())) {
+				conn.Write([]byte(EncodeBulkString(value.value)))
 			} else {
-				conn.Write([]byte(EncodeBulkString("nil")))
+				conn.Write([]byte(EncodeNullBulkString()))
 			}
+			// TODO: Send to the Reaper
 
 		default:
 			log.Printf("[%s] Unknown command '%s'", addr, command)

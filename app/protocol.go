@@ -27,6 +27,10 @@ func EncodeBulkString(value string) string {
 	return fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
 }
 
+func EncodeNullBulkString() string {
+	return "$-1\r\n"
+}
+
 // EncodeArray encodes an array in Redis protocol
 func EncodeArray(values []string) string {
 	var buffer bytes.Buffer
