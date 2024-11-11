@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 )
@@ -16,9 +17,25 @@ func main() {
 		fmt.Println("Failed to bind to port 6379")
 		os.Exit(1)
 	}
-	_, err = l.Accept()
+	conn, err := l.Accept()
 	if err != nil {
 		fmt.Println("Error accepting connection: ", err.Error())
 		os.Exit(1)
+	}
+
+	defer conn.Close()
+
+	buf := make([]byte, 128)
+
+	_, err = conn.Read(buf)
+	if err != nil {
+		panic("Could not read command.")
+	}
+
+	log.Printf("[%s][command] %s", conn.RemoteAddr().String(), buf)
+
+	_, err = conn.Write([]byte("+PONG\r\n"))
+	if err != nil {
+		panic("Could not write response.")
 	}
 }
