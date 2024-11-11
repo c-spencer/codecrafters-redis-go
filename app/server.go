@@ -39,6 +39,13 @@ func main() {
 		panic("Could not write response.")
 	}
 
+	_, err = conn.Read(buf)
+	if err != nil {
+		panic("Could not read command.")
+	}
+
+	log.Printf("[%s][command] %s", conn.RemoteAddr().String(), buf)
+
 	_, err = conn.Write([]byte("+PONG\r\n"))
 	if err != nil {
 		panic("Could not write response.")
