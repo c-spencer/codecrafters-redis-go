@@ -38,4 +38,9 @@ func main() {
 	if err != nil {
 		panic("Could not write response.")
 	}
+
+	_, err = conn.Write([]byte("+PONG\r\n"))
+	if err != nil {
+		panic("Could not write response.")
+	}
 }
