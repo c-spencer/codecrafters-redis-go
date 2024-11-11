@@ -79,10 +79,24 @@ func handleConnection(conn net.Conn) {
 			}
 		}
 
-		if len(elements) == 1 && strings.ToUpper(elements[0]) == "PING" {
-			log.Printf("[%s] Received PING", addr)
+		command := strings.ToUpper(elements[0])
+		log.Printf("[%s] Received command %s", addr, command)
+
+		switch command {
+		case "PING":
 			conn.Write([]byte("+PONG\r\n"))
-		} else {
+		case "ECHO":
+			if len(elements) != 2 {
+				log.Printf("[%s] Malformed ECHO request: %#v", addr, elements)
+				return
+			}
+
+			// Format as Bulk String and return response.
+			resp := fmt.Sprintf("$%d\r\n%s\r\n", len(elements[1]), elements[1])
+
+			conn.Write([]byte(resp))
+
+		default:
 			log.Printf("[%s] Unknown command '%s'", addr, elements[0])
 		}
 	}
