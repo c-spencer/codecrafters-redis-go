@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 // EncodeString encodes a simple string in Redis protocol
@@ -42,23 +43,37 @@ func ReadLine(reader *bufio.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return line[:len(line)-2], nil // Remove \r\n
+	// Remove trailing \r if present
+	// Conditional to support inline commands
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// Parse a BulkString or Array length line
+func parseLengthLine(reader *bufio.Reader, pattern string) (int, error) {
+	lengthLine, err := ReadLine(reader)
+	if err != nil {
+		return 0, err
+	}
+	var length int
+	_, err = fmt.Sscanf(lengthLine, pattern, &length)
+	if err != nil {
+		return 0, err
+	}
+
+	return length, nil
 }
 
 // ReadBulkString reads a bulk string from the reader
 func ReadBulkString(reader *bufio.Reader) (string, error) {
-	lengthLine, err := ReadLine(reader)
-	if err != nil {
-		return "", err
-	}
-	var length int
-	_, err = fmt.Sscanf(lengthLine, "$%d", &length)
+	length, err := parseLengthLine(reader, "$%d")
 	if err != nil {
 		return "", err
 	}
 	if length == -1 {
 		return "", nil // Null bulk string
 	}
+
+	// Read the contents line, sizing the buffer to the declared length.
 	buf := make([]byte, length+2)
 	_, err = reader.Read(buf)
 	if err != nil {
@@ -69,18 +84,15 @@ func ReadBulkString(reader *bufio.Reader) (string, error) {
 
 // ReadArray reads an array from the reader
 func ReadArray(reader *bufio.Reader) ([]string, error) {
-	lengthLine, err := ReadLine(reader)
-	if err != nil {
-		return nil, err
-	}
-	var length int
-	_, err = fmt.Sscanf(lengthLine, "*%d", &length)
+	length, err := parseLengthLine(reader, "*%d")
 	if err != nil {
 		return nil, err
 	}
 	if length == -1 {
 		return nil, nil // Null array
 	}
+
+	// Read number of BulkStrings as declared
 	values := make([]string, length)
 	for i := 0; i < length; i++ {
 		value, err := ReadBulkString(reader)
