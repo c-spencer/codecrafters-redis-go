@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -35,69 +35,40 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	buf := make([]byte, 1024)
+	reader := bufio.NewReader(conn)
 	addr := conn.RemoteAddr().String()
 
 	for {
-		length, err := conn.Read(buf)
-
-		if err == io.EOF {
-			log.Printf("[%s] Connection Closed\n", addr)
-			return
-		} else if err != nil {
-			log.Printf("Error reading: %#v\n", err)
-			return
-		}
-
-		rawMessage := string(buf[:length])
-		lines := strings.Split(rawMessage, "\r\n")
-
-		if len(lines) == 0 {
-			continue
-		}
-
 		// For now, assume command is sent as a Bulk String
 
-		elements := []string{}
-
-		// Assume the first line is correct, and parse out the rest.
-
-		for i := 1; i < len(lines); i++ {
-			if strings.HasPrefix(lines[i], "$") {
-				elementLength, err := strconv.Atoi(lines[i][1:])
-				if err != nil {
-					log.Printf("[%s] Error parsing element length: %#v\n", addr, err)
-				}
-
-				if i+1 < len(lines) && len(lines[i+1]) == elementLength {
-					elements = append(elements, lines[i+1])
-					i++
-				} else {
-					log.Printf("[%s] Invalid Bulk String command received: %#v", addr, lines)
-					return
-				}
-			}
+		rawCommand, err := ReadArray(reader)
+		if err == io.EOF {
+			log.Printf("[%s] Disconnected", addr)
+			return
+		}
+		if err != nil {
+			log.Printf("[%s] Got error reading client command `%#v`", addr, err)
+			return
 		}
 
-		command := strings.ToUpper(elements[0])
+		command := strings.ToUpper(rawCommand[0])
 		log.Printf("[%s] Received command %s", addr, command)
 
 		switch command {
 		case "PING":
-			conn.Write([]byte("+PONG\r\n"))
+			conn.Write([]byte(EncodeString("PONG")))
 		case "ECHO":
-			if len(elements) != 2 {
-				log.Printf("[%s] Malformed ECHO request: %#v", addr, elements)
+			if len(rawCommand) != 2 {
+				log.Printf("[%s] Malformed ECHO request: %#v", addr, rawCommand)
 				return
 			}
 
 			// Format as Bulk String and return response.
-			resp := fmt.Sprintf("$%d\r\n%s\r\n", len(elements[1]), elements[1])
-
-			conn.Write([]byte(resp))
+			conn.Write([]byte(EncodeBulkString(rawCommand[1])))
 
 		default:
-			log.Printf("[%s] Unknown command '%s'", addr, elements[0])
+			log.Printf("[%s] Unknown command '%s'", addr, command)
+			conn.Write([]byte(EncodeError("Unknown Command")))
 		}
 	}
 }
