@@ -38,6 +38,7 @@ func main() {
 	if err != nil {
 		panic("Could not write response.")
 	}
+	log.Printf("Sent PONG")
 
 	_, err = conn.Read(buf)
 	if err != nil {
@@ -50,4 +51,5 @@ func main() {
 	if err != nil {
 		panic("Could not write response.")
 	}
+	log.Printf("Sent PONG")
 }
