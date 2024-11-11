@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 )
 
 func main() {
@@ -14,42 +17,73 @@ func main() {
 	// Bind to port
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
-		os.Exit(1)
-	}
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
+		log.Println("Failed to bind to port 6379")
 		os.Exit(1)
 	}
 
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Println("Error accepting connection: ", err.Error())
+			os.Exit(1)
+		}
+
+		handleConnection(conn)
+	}
+}
+
+func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	buf := make([]byte, 128)
+	buf := make([]byte, 1024)
+	addr := conn.RemoteAddr().String()
 
-	_, err = conn.Read(buf)
-	if err != nil {
-		panic("Could not read command.")
+	for {
+		length, err := conn.Read(buf)
+
+		if err == io.EOF {
+			log.Printf("[%s] Connection Closed\n", addr)
+			return
+		} else if err != nil {
+			log.Printf("Error reading: %#v\n", err)
+			return
+		}
+
+		rawMessage := string(buf[:length])
+		lines := strings.Split(rawMessage, "\r\n")
+
+		if len(lines) == 0 {
+			continue
+		}
+
+		// For now, assume command is sent as a Bulk String
+
+		elements := []string{}
+
+		// Assume the first line is correct, and parse out the rest.
+
+		for i := 1; i < len(lines); i++ {
+			if strings.HasPrefix(lines[i], "$") {
+				elementLength, err := strconv.Atoi(lines[i][1:])
+				if err != nil {
+					log.Printf("[%s] Error parsing element length: %#v\n", addr, err)
+				}
+
+				if i+1 < len(lines) && len(lines[i+1]) == elementLength {
+					elements = append(elements, lines[i+1])
+					i++
+				} else {
+					log.Printf("[%s] Invalid Bulk String command received: %#v", addr, lines)
+					return
+				}
+			}
+		}
+
+		if len(elements) == 1 && strings.ToUpper(elements[0]) == "PING" {
+			log.Printf("[%s] Received PING", addr)
+			conn.Write([]byte("+PONG\r\n"))
+		} else {
+			log.Printf("[%s] Unknown command '%s'", addr, elements[0])
+		}
 	}
-
-	log.Printf("[%s][command] %s", conn.RemoteAddr().String(), buf)
-
-	_, err = conn.Write([]byte("+PONG\r\n"))
-	if err != nil {
-		panic("Could not write response.")
-	}
-	log.Printf("Sent PONG")
-
-	_, err = conn.Read(buf)
-	if err != nil {
-		panic("Could not read command.")
-	}
-
-	log.Printf("[%s][command] %s", conn.RemoteAddr().String(), buf)
-
-	_, err = conn.Write([]byte("+PONG\r\n"))
-	if err != nil {
-		panic("Could not write response.")
-	}
-	log.Printf("Sent PONG")
 }
