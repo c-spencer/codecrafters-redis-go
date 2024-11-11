@@ -16,6 +16,7 @@ import (
 type ServerState struct {
 	mutex  sync.RWMutex
 	values map[string]ValueEntry
+	config map[string]string
 }
 
 type ValueEntry struct {
@@ -25,12 +26,27 @@ type ValueEntry struct {
 }
 
 func main() {
+	dir := "/tmp"
+	dbfilename := "dump.rdb"
+
+	for i, arg := range os.Args {
+		if arg == "--dir" && i+1 < len(os.Args) {
+			dir = os.Args[i+1]
+		} else if arg == "--dbfilename" && i+1 < len(os.Args) {
+			dbfilename = os.Args[i+1]
+		}
+	}
+
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here.")
 
 	state := ServerState{
 		mutex:  sync.RWMutex{},
 		values: map[string]ValueEntry{},
+		config: map[string]string{
+			"dir":        dir,
+			"dbfilename": dbfilename,
+		},
 	}
 
 	// Bind to port
@@ -173,6 +189,21 @@ func handleConnection(conn net.Conn, state *ServerState) {
 				conn.Write([]byte(EncodeNullBulkString()))
 			}
 			// TODO: Send to the Reaper
+
+		case "CONFIG":
+			if len(rawCommand) == 3 && strings.ToUpper(rawCommand[1]) == "GET" {
+				value, exists := state.config[rawCommand[2]]
+
+				if exists {
+					conn.Write([]byte(EncodeArray([]string{rawCommand[2], value})))
+				} else {
+					conn.Write([]byte(EncodeNullBulkString()))
+				}
+			} else {
+				log.Printf("[%s] Malformed GET request: %#v", addr, rawCommand)
+				conn.Write([]byte(EncodeError("Malformed request.")))
+				continue
+			}
 
 		default:
 			log.Printf("[%s] Unknown command '%s'", addr, command)
