@@ -8,7 +8,7 @@ import (
 
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here!")
+	fmt.Println("Logs from your program will appear here.")
 
 	// Bind to port
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
