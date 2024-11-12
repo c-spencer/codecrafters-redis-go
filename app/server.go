@@ -311,18 +311,6 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			properties[command.arguments[i]] = command.arguments[i+1]
 		}
 
-		entryId, err := rdb.EntryIdFromString(rawEntryId)
-
-		if err != nil {
-			result := protocol.EncodeError(err.Error())
-			return &result
-		}
-
-		entry := rdb.StreamEntry{
-			Id:         *entryId,
-			Properties: properties,
-		}
-
 		state.mutex.Lock()
 
 		// Check that the stream key exists, and if not create it
@@ -346,6 +334,19 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 		// Now we know the value exists and is a stream
 		stream := value.Value.(*rdb.Stream)
+
+		entryId, err := rdb.EntryIdFromString(rawEntryId, stream)
+
+		if err != nil {
+			result := protocol.EncodeError(err.Error())
+			state.mutex.Unlock()
+			return &result
+		}
+
+		entry := rdb.StreamEntry{
+			Id:         *entryId,
+			Properties: properties,
+		}
 
 		// Validate the entryId is valid for the given stream
 		err = entryId.ValidateAgainstStream(value.Value.(*rdb.Stream))

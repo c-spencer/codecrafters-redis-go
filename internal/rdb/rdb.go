@@ -52,7 +52,7 @@ type EntryId struct {
 	SequenceNumber int
 }
 
-func EntryIdFromString(s string) (*EntryId, error) {
+func EntryIdFromString(s string, stream *Stream) (*EntryId, error) {
 	parts := strings.Split(s, "-")
 	if len(parts) != 2 {
 		return nil, fmt.Errorf("invalid entry ID format")
@@ -63,9 +63,25 @@ func EntryIdFromString(s string) (*EntryId, error) {
 		return nil, fmt.Errorf("invalid millisecond time: %v", err)
 	}
 
-	seq, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("invalid sequence number: %v", err)
+	// Parse the sequence number, or auto generate from the existing stream.
+	var seq = 0
+	if parts[1] == "*" {
+		if len(stream.Entries) > 0 {
+			lastId := stream.Entries[len(stream.Entries)-1].Id
+
+			if lastId.MilliTime == milli {
+				seq = lastId.SequenceNumber + 1
+			}
+		} else {
+			if milli == 0 {
+				seq = 1
+			}
+		}
+	} else {
+		seq, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return nil, fmt.Errorf("invalid sequence number: %v", err)
+		}
 	}
 
 	entry := EntryId{
@@ -88,7 +104,7 @@ func (e EntryId) ValidateAgainstStream(s *Stream) error {
 	if len(s.Entries) > 0 {
 		lastId := s.Entries[len(s.Entries)-1].Id
 
-		if e.MilliTime < lastId.MilliTime || e.SequenceNumber <= lastId.SequenceNumber {
+		if e.MilliTime < lastId.MilliTime || (e.MilliTime == lastId.MilliTime && e.SequenceNumber <= lastId.SequenceNumber) {
 			return errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
 		}
 	}
