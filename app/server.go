@@ -209,7 +209,8 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		state.mutex.RUnlock()
 
 		if exists && (value.Expiry == nil || value.Expiry.After(time.Now())) {
-			result := protocol.EncodeBulkString(value.Value)
+			// TODO: Check type
+			result := protocol.EncodeBulkString(value.Value.(string))
 			return &result
 		} else {
 			result := protocol.EncodeNullBulkString()
@@ -247,7 +248,8 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 		// If exists and unexpired, increment by 1
 		if exists && (current.Expiry == nil || current.Expiry.After(time.Now())) {
-			x, err = strconv.Atoi(current.Value)
+			// TODO: Check type is string
+			x, err = strconv.Atoi(current.Value.(string))
 
 			if err != nil {
 				state.mutex.Unlock()
@@ -291,10 +293,25 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			return nil
 		}
 
-	case "MULTI":
-		conn.isBuffering = true
-		result := protocol.EncodeString("OK")
-		return &result
+	case "TYPE":
+		if len(command.arguments) < 1 {
+			respondToBadCommand(conn, command)
+			return nil
+		}
+
+		state.mutex.RLock()
+		value, exists := state.values[command.arguments[0]]
+
+		if exists {
+			result := protocol.EncodeString(rdb.TypeToString(value.Type))
+			state.mutex.RUnlock()
+			return &result
+		} else {
+			state.mutex.RUnlock()
+
+			result := protocol.EncodeString("none")
+			return &result
+		}
 
 	default:
 		respondToBadCommand(conn, command)

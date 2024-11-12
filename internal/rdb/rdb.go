@@ -12,8 +12,25 @@ import (
 
 type ValueEntry struct {
 	Key    string
-	Value  string
+	Value  interface{}
+	Type   int
 	Expiry *time.Time
+}
+
+const (
+	TString = iota
+	TSet    = iota
+)
+
+func TypeToString(t int) string {
+	switch t {
+	case TString:
+		return "string"
+	case TSet:
+		return "set"
+	default:
+		return "unknown"
+	}
 }
 
 func readHeader(reader *bufio.Reader) int {
@@ -211,6 +228,7 @@ func readDatabase(reader *bufio.Reader) map[string]*ValueEntry {
 			hashtable[name] = &ValueEntry{
 				Key:    name,
 				Value:  value,
+				Type:   TString,
 				Expiry: nil,
 			}
 		}
