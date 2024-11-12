@@ -117,13 +117,13 @@ func replicator(replicaof string, state *ServerState) {
 	parts := strings.Split(replicaof, " ")
 
 	if len(parts) != 2 {
-		log.Fatalf("replicaof must be of form '<HOST> <PORT>', got '%s'", replicaof)
+		log.Fatalf("[replicator] replicaof must be of form '<HOST> <PORT>', got '%s'", replicaof)
 	}
 
 	conn, err := net.Dial("tcp", strings.Join(parts, ":"))
 
 	if err != nil {
-		log.Fatalf("Got error connecting to master %#v", err)
+		log.Fatalf("[replicator] Got error connecting to master %#v", err)
 	}
 
 	reader := bufio.NewReader(conn)
@@ -135,7 +135,7 @@ func replicator(replicaof string, state *ServerState) {
 	resp, _ := protocol.ReadString(reader)
 
 	if resp != "PONG" {
-		log.Fatalf("Expected PONG in response to PING, got %s", resp)
+		log.Fatalf("[replicator] Expected PONG in response to PING, got %s", resp)
 	}
 
 	// Handshake part 2
@@ -146,7 +146,7 @@ func replicator(replicaof string, state *ServerState) {
 	})))
 	resp, _ = protocol.ReadString(reader)
 	if resp != "OK" {
-		log.Fatalf("Expected OK in response to REPLCONF, got %s", resp)
+		log.Fatalf("[replicator] Expected OK in response to REPLCONF, got %s", resp)
 	}
 
 	conn.Write([]byte(protocol.EncodeArray([]string{
@@ -154,8 +154,16 @@ func replicator(replicaof string, state *ServerState) {
 	})))
 	resp, _ = protocol.ReadString(reader)
 	if resp != "OK" {
-		log.Fatalf("Expected OK in response to REPLCONF, got %s", resp)
+		log.Fatalf("[replicator] Expected OK in response to REPLCONF, got %s", resp)
 	}
+
+	// Handshake part 3
+	// PSYNC
+
+	conn.Write([]byte(protocol.EncodeArray([]string{"PSYNC", "?", "-1"})))
+	resp, _ = protocol.ReadString(reader)
+
+	log.Printf("[replicator] Got PSYNC response: %s", resp)
 
 	for {
 	}
