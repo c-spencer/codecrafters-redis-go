@@ -586,6 +586,8 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 					if !ok {
 						break BlockingLoop
 					}
+					// Check whether the broadcast value matches any of the streams we're watching.
+					// This assumes accessing value.Key is safe, as .Key is never modified.
 					if value != nil && slices.Contains(streamNames, value.Key) {
 						result = value
 						break BlockingLoop
@@ -593,13 +595,14 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 				}
 			}
 
-			// Unconditionally reacquire the lock to clean up channel
+			// Unconditionally reacquire the lock to clean up channel and
+			// compile results from the global state.
 			state.mutex.RLock()
 
-			close(*watchChannel)
 			delete(state.watchers, conn.id)
 
 			// If we found a result, add the latest value from that stream into the results.
+			// This assumes only a single value can be added?
 			if result != nil {
 				stream := result.Value.(*rdb.Stream)
 
