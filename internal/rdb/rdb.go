@@ -124,7 +124,7 @@ func readSize(reader *bufio.Reader) (int, bool) {
 	}
 }
 
-func readDatabase(reader *bufio.Reader) map[string]ValueEntry {
+func readDatabase(reader *bufio.Reader) map[string]*ValueEntry {
 	b, err := reader.ReadByte()
 	if err != nil || b != 0xFE {
 		panic("Expected 0xFE marker byte as database section marker")
@@ -140,7 +140,7 @@ func readDatabase(reader *bufio.Reader) map[string]ValueEntry {
 	tableSize, _ := readSize(reader)
 	readSize(reader) // Skip expiringKeySize
 
-	hashtable := make(map[string]ValueEntry, tableSize)
+	hashtable := make(map[string]*ValueEntry, tableSize)
 
 	for {
 		b, _ = reader.ReadByte()
@@ -171,7 +171,7 @@ func readDatabase(reader *bufio.Reader) map[string]ValueEntry {
 				continue
 			}
 
-			hashtable[name] = ValueEntry{
+			hashtable[name] = &ValueEntry{
 				Key:    name,
 				Value:  value,
 				Expiry: &expiry,
@@ -197,7 +197,7 @@ func readDatabase(reader *bufio.Reader) map[string]ValueEntry {
 				continue
 			}
 
-			hashtable[name] = ValueEntry{
+			hashtable[name] = &ValueEntry{
 				Key:    name,
 				Value:  value,
 				Expiry: &expiry,
@@ -208,7 +208,7 @@ func readDatabase(reader *bufio.Reader) map[string]ValueEntry {
 			name := readString(reader)
 			value := readString(reader)
 
-			hashtable[name] = ValueEntry{
+			hashtable[name] = &ValueEntry{
 				Key:    name,
 				Value:  value,
 				Expiry: nil,
@@ -220,7 +220,7 @@ func readDatabase(reader *bufio.Reader) map[string]ValueEntry {
 type LoadedDatabase struct {
 	Version   int
 	Metadata  map[string]string
-	Hashtable map[string]ValueEntry
+	Hashtable map[string]*ValueEntry
 }
 
 func LoadDatabase(path string) (*LoadedDatabase, error) {

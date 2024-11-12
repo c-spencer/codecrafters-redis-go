@@ -19,7 +19,7 @@ import (
 
 type ServerState struct {
 	mutex  sync.RWMutex
-	values map[string]rdb.ValueEntry
+	values map[string]*rdb.ValueEntry
 	config map[string]string
 }
 
@@ -42,7 +42,7 @@ func main() {
 
 	state := ServerState{
 		mutex:  sync.RWMutex{},
-		values: map[string]rdb.ValueEntry{},
+		values: map[string]*rdb.ValueEntry{},
 		config: config,
 	}
 
@@ -184,7 +184,7 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 		}
 
 		state.mutex.Lock()
-		state.values[value.Key] = value
+		state.values[value.Key] = &value
 		state.mutex.Unlock()
 
 		conn.Write([]byte(protocol.EncodeString("OK")))
@@ -232,12 +232,24 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 
 		current, exists := state.values[command.arguments[0]]
 
-		if exists && current.Expiry == nil || current.Expiry.After(time.Now()) {
+		// If exists and unexpired, increment by 1
+		if exists && (current.Expiry == nil || current.Expiry.After(time.Now())) {
 			x, _ = strconv.Atoi(current.Value) // TODO: Error Handling
 
 			x += 1
 
 			current.Value = strconv.Itoa(x)
+		} else {
+			// Otherwise create the key and give it the value 1
+			x = 1
+
+			value := rdb.ValueEntry{
+				Key:    command.arguments[0],
+				Value:  "1",
+				Expiry: nil,
+			}
+
+			state.values[command.arguments[0]] = &value
 		}
 
 		state.mutex.Unlock()
