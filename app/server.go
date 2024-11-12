@@ -227,6 +227,7 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 		}
 
 		var x = 0
+		var err error = nil
 
 		state.mutex.Lock()
 
@@ -234,10 +235,15 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 
 		// If exists and unexpired, increment by 1
 		if exists && (current.Expiry == nil || current.Expiry.After(time.Now())) {
-			x, _ = strconv.Atoi(current.Value) // TODO: Error Handling
+			x, err = strconv.Atoi(current.Value)
+
+			if err != nil {
+				state.mutex.Unlock()
+				conn.Write([]byte(protocol.EncodeError("ERR value is not an integer or out of range")))
+				return
+			}
 
 			x += 1
-
 			current.Value = strconv.Itoa(x)
 		} else {
 			// Otherwise create the key and give it the value 1
