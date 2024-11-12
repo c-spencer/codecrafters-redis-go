@@ -321,8 +321,18 @@ func handleConnection(conn net.Conn, state *ServerState) {
 			return
 		}
 
+		// Meta commands dealing with Transactions
 		if command.name == "MULTI" {
 			connState.isBuffering = true
+			connState.conn.Write([]byte(protocol.EncodeString("OK")))
+		} else if command.name == "DISCARD" {
+			if !connState.isBuffering {
+				connState.conn.Write([]byte(protocol.EncodeError("ERR DISCARD without MULTI")))
+				return
+			}
+
+			connState.buffer = []*Command{}
+			connState.isBuffering = false
 			connState.conn.Write([]byte(protocol.EncodeString("OK")))
 		} else if command.name == "EXEC" {
 			if !connState.isBuffering {
