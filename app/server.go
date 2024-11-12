@@ -143,13 +143,19 @@ type ConnState struct {
 func processCommand(conn *ConnState, command *Command, state *ServerState) {
 	log.Printf("[%s] Received command %s", conn.addr, command.name)
 
-	if conn.isBuffering {
+	if conn.isBuffering && command.name != "EXEC" {
 		conn.buffer = append(conn.buffer, command)
 		conn.conn.Write([]byte(protocol.EncodeString("QUEUED")))
 		return
 	}
 
 	switch command.name {
+	case "EXEC":
+		if !conn.isBuffering {
+			conn.conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
+			return
+		}
+
 	case "PING":
 		conn.conn.Write([]byte(protocol.EncodeString("PONG")))
 
