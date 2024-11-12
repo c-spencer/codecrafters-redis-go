@@ -41,6 +41,16 @@ func EncodeArray(values []string) string {
 	return buffer.String()
 }
 
+// EncodeEncodedArray encodes an array of already encoded strings
+func EncodeEncodedArray(values []*string) string {
+	var buffer bytes.Buffer
+	buffer.WriteString(fmt.Sprintf("*%d\r\n", len(values)))
+	for _, value := range values {
+		buffer.WriteString(*value)
+	}
+	return buffer.String()
+}
+
 // ReadLine reads a single line from the reader
 func ReadLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')

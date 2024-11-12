@@ -140,25 +140,27 @@ type ConnState struct {
 	addr        string
 }
 
-func processCommand(conn *ConnState, command *Command, state *ServerState) {
+func processCommand(conn *ConnState, command *Command, state *ServerState) *string {
 	log.Printf("[%s] Received command %s", conn.addr, command.name)
 
 	switch command.name {
 	case "PING":
-		conn.conn.Write([]byte(protocol.EncodeString("PONG")))
+		result := protocol.EncodeString("PONG")
+		return &result
 
 	case "ECHO":
 		if len(command.arguments) != 1 {
 			respondToBadCommand(conn, command)
-			return
+			return nil
 		}
 
-		conn.conn.Write([]byte(protocol.EncodeBulkString(command.arguments[0])))
+		result := protocol.EncodeBulkString(command.arguments[0])
+		return &result
 
 	case "SET":
 		if len(command.arguments) < 2 {
 			respondToBadCommand(conn, command)
-			return
+			return nil
 		}
 
 		var expiry *time.Time = nil
@@ -169,7 +171,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) {
 
 			if err != nil {
 				respondToBadCommand(conn, command)
-				return
+				return nil
 			}
 
 			if strings.ToUpper(command.arguments[2]) == "PX" {
@@ -193,12 +195,13 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) {
 		state.values[value.Key] = &value
 		state.mutex.Unlock()
 
-		conn.conn.Write([]byte(protocol.EncodeString("OK")))
+		result := protocol.EncodeString("OK")
+		return &result
 
 	case "GET":
 		if len(command.arguments) != 1 {
 			respondToBadCommand(conn, command)
-			return
+			return nil
 		}
 
 		state.mutex.RLock()
@@ -206,9 +209,11 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) {
 		state.mutex.RUnlock()
 
 		if exists && (value.Expiry == nil || value.Expiry.After(time.Now())) {
-			conn.conn.Write([]byte(protocol.EncodeBulkString(value.Value)))
+			result := protocol.EncodeBulkString(value.Value)
+			return &result
 		} else {
-			conn.conn.Write([]byte(protocol.EncodeNullBulkString()))
+			result := protocol.EncodeNullBulkString()
+			return &result
 		}
 		// TODO: Send to the Reaper
 
@@ -224,12 +229,13 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) {
 
 		state.mutex.RUnlock()
 
-		conn.conn.Write([]byte(protocol.EncodeArray(keys)))
+		result := protocol.EncodeArray(keys)
+		return &result
 
 	case "INCR":
 		if len(command.arguments) < 1 {
 			respondToBadCommand(conn, command)
-			return
+			return nil
 		}
 
 		var x = 0
@@ -246,7 +252,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) {
 			if err != nil {
 				state.mutex.Unlock()
 				conn.conn.Write([]byte(protocol.EncodeError("ERR value is not an integer or out of range")))
-				return
+				return nil
 			}
 
 			x += 1
@@ -266,27 +272,33 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) {
 
 		state.mutex.Unlock()
 
-		conn.conn.Write([]byte(protocol.EncodeInteger(x)))
+		result := protocol.EncodeInteger(x)
+		return &result
 
 	case "CONFIG":
 		if len(command.arguments) == 2 && strings.ToUpper(command.arguments[0]) == "GET" {
 			value, exists := state.config[command.arguments[1]]
 
 			if exists {
-				conn.conn.Write([]byte(protocol.EncodeArray([]string{command.arguments[1], value})))
+				result := protocol.EncodeArray([]string{command.arguments[1], value})
+				return &result
 			} else {
-				conn.conn.Write([]byte(protocol.EncodeNullBulkString()))
+				result := protocol.EncodeNullBulkString()
+				return &result
 			}
 		} else {
 			respondToBadCommand(conn, command)
+			return nil
 		}
 
 	case "MULTI":
 		conn.isBuffering = true
-		conn.conn.Write([]byte(protocol.EncodeString("OK")))
+		result := protocol.EncodeString("OK")
+		return &result
 
 	default:
 		respondToBadCommand(conn, command)
+		return nil
 	}
 }
 
@@ -317,16 +329,25 @@ func handleConnection(conn net.Conn, state *ServerState) {
 				connState.conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
 				return
 			}
-			// TODO: Execute commands
 
-			connState.conn.Write([]byte(protocol.EncodeArray([]string{})))
+			// Iterate through the buffer and store the results of each command in sequence
+			var results = []*string{}
+			for i := range connState.buffer {
+				results = append(results, processCommand(&connState, connState.buffer[i], state))
+			}
+
+			// As the return values of processCommand are themselves already encoded, just encode
+			// the outer Array wrapper to return the values.
+			connState.conn.Write([]byte(protocol.EncodeEncodedArray(results)))
+
 			connState.buffer = []*Command{}
 			connState.isBuffering = false
 		} else if connState.isBuffering {
 			connState.buffer = append(connState.buffer, command)
 			connState.conn.Write([]byte(protocol.EncodeString("QUEUED")))
 		} else {
-			processCommand(&connState, command, state)
+			result := processCommand(&connState, command, state)
+			connState.conn.Write([]byte(*result))
 		}
 	}
 }
