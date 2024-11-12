@@ -360,7 +360,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		stream.Entries = append(stream.Entries, &entry)
 		state.mutex.Unlock()
 
-		result := protocol.EncodeString(entry.Id.String())
+		result := protocol.EncodeBulkString(entry.Id.String())
 		return &result
 
 	case "TYPE":
