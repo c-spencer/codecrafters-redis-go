@@ -42,11 +42,11 @@ func EncodeArray(values []string) string {
 }
 
 // EncodeEncodedArray encodes an array of already encoded strings
-func EncodeEncodedArray(values []*string) string {
+func EncodeEncodedArray(values []string) string {
 	var buffer bytes.Buffer
 	buffer.WriteString(fmt.Sprintf("*%d\r\n", len(values)))
 	for _, value := range values {
-		buffer.WriteString(*value)
+		buffer.WriteString(value)
 	}
 	return buffer.String()
 }

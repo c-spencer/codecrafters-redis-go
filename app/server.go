@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,10 +18,13 @@ import (
 	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
 )
 
+type ValueWatchChannel chan *rdb.ValueEntry
+
 type ServerState struct {
-	mutex  sync.RWMutex
-	values map[string]*rdb.ValueEntry
-	config map[string]string
+	mutex    sync.RWMutex
+	values   map[string]*rdb.ValueEntry
+	config   map[string]string
+	watchers map[int]*ValueWatchChannel
 }
 
 func main() {
@@ -41,9 +45,10 @@ func main() {
 	}
 
 	state := ServerState{
-		mutex:  sync.RWMutex{},
-		values: map[string]*rdb.ValueEntry{},
-		config: config,
+		mutex:    sync.RWMutex{},
+		values:   map[string]*rdb.ValueEntry{},
+		config:   config,
+		watchers: map[int]*ValueWatchChannel{},
 	}
 
 	db, err := rdb.LoadDatabase(path.Join(dir, dbfilename))
@@ -63,6 +68,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	connCounter := 1
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -70,7 +77,9 @@ func main() {
 			os.Exit(1)
 		}
 
-		go handleConnection(conn, &state)
+		go handleConnection(conn, connCounter, &state)
+
+		connCounter += 1
 	}
 }
 
@@ -134,10 +143,24 @@ func receiveCommand(reader *bufio.Reader) (*Command, error) {
 }
 
 type ConnState struct {
+	id          int
 	conn        net.Conn
 	isBuffering bool
 	buffer      []*Command
 	addr        string
+}
+
+func encodeEntry(entry *rdb.StreamEntry) string {
+	props := []string{}
+
+	for j := range entry.Properties {
+		props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
+	}
+
+	return protocol.EncodeEncodedArray([]string{
+		protocol.EncodeString(entry.Id.String()),
+		protocol.EncodeArray(props),
+	})
 }
 
 func processCommand(conn *ConnState, command *Command, state *ServerState) *string {
@@ -361,6 +384,13 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 		// Finally append the validated entry into the stream.
 		stream.Entries = append(stream.Entries, &entry)
+
+		// Find watches for this stream and notify for change (sending the
+		// stream name so watchers can easily identify the channel).
+		for i := range state.watchers {
+			*state.watchers[i] <- value
+		}
+
 		state.mutex.Unlock()
 
 		result := protocol.EncodeBulkString(entry.Id.String())
@@ -416,7 +446,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			end, _ = rdb.EntryIdFromString(rawEnd, stream)
 		}
 
-		resp := []*string{}
+		resp := []string{}
 
 		// TODO: Binary search for the starting point.
 		for i := range stream.Entries {
@@ -429,22 +459,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 				break
 			}
 
-			id := protocol.EncodeString(entry.Id.String())
-
-			props := []string{}
-
-			for j := range entry.Properties {
-				props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
-			}
-
-			encodedProps := protocol.EncodeArray(props)
-
-			entryEncoded := protocol.EncodeEncodedArray([]*string{
-				&id,
-				&encodedProps,
-			})
-
-			resp = append(resp, &entryEncoded)
+			resp = append(resp, encodeEntry(entry))
 		}
 
 		state.mutex.RUnlock()
@@ -453,23 +468,40 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		return &result
 
 	case "XREAD":
-		if len(command.arguments) < 3 || strings.ToUpper(command.arguments[0]) != "STREAMS" {
+		if len(command.arguments) < 3 {
+			respondToBadCommand(conn, command)
+			return nil
+		}
+
+		argumentOffset := 0
+		blocking := 0
+
+		if strings.ToUpper(command.arguments[0]) == "BLOCK" {
+			argumentOffset += 2
+			// TODO: Error handling
+			blocking, _ = strconv.Atoi(command.arguments[1])
+		}
+		if strings.ToUpper(command.arguments[argumentOffset]) == "STREAMS" {
+			argumentOffset += 1
+		} else {
 			respondToBadCommand(conn, command)
 			return nil
 		}
 
 		state.mutex.RLock()
 
-		pairs := (len(command.arguments) - 1) / 2
+		pairs := (len(command.arguments) - argumentOffset) / 2
 
 		// streamsResults holds all pairs of (stream id, entry results)
-		streamsResults := []*string{}
+		streamsResults := []string{}
+		streamNames := []string{}
 
 		// Streams and starting points are send as (a, b, c, a-start, b-start, c-start)
-		// So for given pair, the start is at i and i+pairCount (offset by 1 for the STREAMS keyword)
+		// So for given pair, the start is at i and i+pairCount (offset for the initial arguments)
 		for i := 0; i < pairs; i++ {
-			streamName := command.arguments[1+i]
-			rawStart := command.arguments[1+i+pairs]
+			streamName := command.arguments[argumentOffset+i]
+			streamNames = append(streamNames, streamName)
+			rawStart := command.arguments[argumentOffset+i+pairs]
 
 			log.Printf("XREAD %s %s", streamName, rawStart)
 
@@ -492,7 +524,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 			// Stream results holds the (entry-id, properties) pairs that have been
 			// encoded into an Array string
-			streamResults := []*string{}
+			streamResults := []string{}
 
 			// TODO: Binary search for the starting point.
 			for i := range stream.Entries {
@@ -502,41 +534,87 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 					continue
 				}
 
-				id := protocol.EncodeString(entry.Id.String())
-
-				props := []string{}
-
-				for j := range entry.Properties {
-					props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
-				}
-
-				encodedProps := protocol.EncodeArray(props)
-
-				entryEncoded := protocol.EncodeEncodedArray([]*string{
-					&id,
-					&encodedProps,
-				})
-
-				streamResults = append(streamResults, &entryEncoded)
+				streamResults = append(streamResults, encodeEntry(entry))
 			}
 
-			// result is constructed to hold the (stream-id, entries) pair, encoded as
-			// an Array string.
-			streamNameEncoded := protocol.EncodeString(streamName)
-			streamResultsEncoded := protocol.EncodeEncodedArray(streamResults)
-			result := protocol.EncodeEncodedArray([]*string{
-				&streamNameEncoded,
-				&streamResultsEncoded,
-			})
+			if len(streamResults) > 0 {
+				// result is constructed to hold the (stream-id, entries) pair, encoded as
+				// an Array string.
+				result := protocol.EncodeEncodedArray([]string{
+					protocol.EncodeString(streamName),
+					protocol.EncodeEncodedArray(streamResults),
+				})
 
-			streamsResults = append(streamsResults, &result)
+				streamsResults = append(streamsResults, result)
+			}
+		}
+
+		// If we're blocking and no results were found, insert a channel to watch
+		// for changes on.
+		var watchChannel *ValueWatchChannel = nil
+		if len(streamsResults) == 0 && blocking != 0 {
+			c := make(ValueWatchChannel)
+			watchChannel = &c
+			state.watchers[conn.id] = watchChannel
 		}
 
 		state.mutex.RUnlock()
 
-		// The final result is then the encoding of resp inside a top level array.
-		result := protocol.EncodeEncodedArray(streamsResults)
-		return &result
+		// If we opened a watch channel, wait on that channel for changes
+		if watchChannel != nil {
+			timeoutChannel := time.After(time.Duration(blocking) * time.Millisecond)
+
+			var result *rdb.ValueEntry = nil
+
+			// Wait until we timeout, or a stream we're interested in is updated.
+		BlockingLoop:
+			for {
+				select {
+				case <-timeoutChannel:
+					break BlockingLoop
+
+				case value, ok := <-*watchChannel:
+					if !ok {
+						break BlockingLoop
+					}
+					if value != nil && slices.Contains(streamNames, value.Key) {
+						result = value
+						break BlockingLoop
+					}
+				}
+			}
+
+			// Unconditionally reacquire the lock to clean up channel
+			state.mutex.RLock()
+
+			close(*watchChannel)
+			delete(state.watchers, conn.id)
+
+			// If we found a result, add the latest value from that stream into the results.
+			if result != nil {
+				stream := result.Value.(*rdb.Stream)
+
+				encodedEntry := encodeEntry(stream.Entries[len(stream.Entries)-1])
+
+				newStreamResults := protocol.EncodeEncodedArray([]string{
+					protocol.EncodeString(result.Key),
+					protocol.EncodeEncodedArray([]string{encodedEntry}),
+				})
+
+				streamsResults = append(streamsResults, newStreamResults)
+			}
+
+			state.mutex.RUnlock()
+		}
+
+		if len(streamsResults) > 0 {
+			// The final result is then the encoding of resp inside a top level array.
+			result := protocol.EncodeEncodedArray(streamsResults)
+			return &result
+		} else {
+			result := protocol.EncodeNullBulkString()
+			return &result
+		}
 
 	case "TYPE":
 		if len(command.arguments) < 1 {
@@ -564,11 +642,12 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 	}
 }
 
-func handleConnection(conn net.Conn, state *ServerState) {
+func handleConnection(conn net.Conn, connId int, state *ServerState) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
 	connState := ConnState{
+		id:          connId,
 		conn:        conn,
 		isBuffering: false,
 		buffer:      []*Command{},
@@ -603,9 +682,9 @@ func handleConnection(conn net.Conn, state *ServerState) {
 			}
 
 			// Iterate through the buffer and store the results of each command in sequence
-			var results = []*string{}
+			var results = []string{}
 			for i := range connState.buffer {
-				results = append(results, processCommand(&connState, connState.buffer[i], state))
+				results = append(results, *processCommand(&connState, connState.buffer[i], state))
 			}
 
 			// As the return values of processCommand are themselves already encoded, just encode
@@ -621,7 +700,9 @@ func handleConnection(conn net.Conn, state *ServerState) {
 		} else {
 			// Otherwise just execute as we receive.
 			result := processCommand(&connState, command, state)
-			conn.Write([]byte(*result))
+			if result != nil {
+				conn.Write([]byte(*result))
+			}
 		}
 	}
 }
