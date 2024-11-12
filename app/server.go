@@ -392,7 +392,15 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 		stream := value.Value.(*rdb.Stream)
 		// TODO: Handle errors
-		start, _ := rdb.EntryIdFromString(rawStart, stream)
+
+		// Parse the starting point, allowing "-" as from the beginning.
+		var start *rdb.EntryId = nil
+		if rawStart == "-" {
+			start, _ = rdb.EntryIdFromString("0-0", stream)
+		} else {
+			start, _ = rdb.EntryIdFromString(rawStart, stream)
+		}
+
 		end, _ := rdb.EntryIdFromString(rawEnd, stream)
 
 		resp := []*string{}
