@@ -7,22 +7,20 @@ import (
 	"log"
 	"net"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/codecrafters-io/redis-starter-go/internal/protocol"
+	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
 )
 
 type ServerState struct {
 	mutex  sync.RWMutex
-	values map[string]ValueEntry
+	values map[string]rdb.ValueEntry
 	config map[string]string
-}
-
-type ValueEntry struct {
-	key    string
-	value  string
-	expiry *time.Time
 }
 
 func main() {
@@ -37,17 +35,26 @@ func main() {
 		}
 	}
 
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here.")
+	config := map[string]string{
+		"dir":        dir,
+		"dbfilename": dbfilename,
+	}
 
 	state := ServerState{
 		mutex:  sync.RWMutex{},
-		values: map[string]ValueEntry{},
-		config: map[string]string{
-			"dir":        dir,
-			"dbfilename": dbfilename,
-		},
+		values: map[string]rdb.ValueEntry{},
+		config: config,
 	}
+
+	db, err := rdb.LoadDatabase(path.Join(dir, dbfilename))
+
+	// If database loaded without error, use its state.
+	if err == nil {
+		state.values = db.Hashtable
+	}
+
+	// You can use print statements as follows for debugging, they'll be visible when running tests.
+	fmt.Println("Logs from your program will appear here.")
 
 	// Bind to port
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
@@ -79,6 +86,158 @@ func checkReadError(err error, addr string) bool {
 	return false
 }
 
+func respondToBadCommand(conn net.Conn, command *Command) {
+	log.Printf("[%s] Malformed %s request: %#v", conn.RemoteAddr().String(), command.name, command)
+	conn.Write([]byte(protocol.EncodeError("Malformed request.")))
+}
+
+type Command struct {
+	name      string
+	arguments []string
+}
+
+func receiveCommand(reader *bufio.Reader) (*Command, error) {
+	// Peek the first character to determine the datatype being sent
+	c, err := reader.Peek(1)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var rawCommand = []string{}
+
+	switch string(c) {
+	// Read standard Array commands format
+	case "*":
+		rawCommand, err = protocol.ReadArray(reader)
+
+		if err != nil {
+			return nil, err
+		}
+	// Fallback to inline commands format
+	default:
+		rawLine, err := protocol.ReadLine(reader)
+
+		if err != nil {
+			return nil, err
+		}
+
+		rawCommand = strings.Split(rawLine, " ")
+	}
+
+	command := Command{
+		name:      strings.ToUpper(rawCommand[0]),
+		arguments: rawCommand[1:],
+	}
+
+	return &command, nil
+}
+
+func processCommand(conn net.Conn, command *Command, state *ServerState) {
+	addr := conn.RemoteAddr().String()
+	log.Printf("[%s] Received command %s", addr, command.name)
+
+	switch command.name {
+	case "PING":
+		conn.Write([]byte(protocol.EncodeString("PONG")))
+
+	case "ECHO":
+		if len(command.arguments) != 1 {
+			respondToBadCommand(conn, command)
+			return
+		}
+
+		conn.Write([]byte(protocol.EncodeBulkString(command.arguments[0])))
+
+	case "SET":
+		if len(command.arguments) < 2 {
+			respondToBadCommand(conn, command)
+			return
+		}
+
+		var expiry *time.Time = nil
+
+		if len(command.arguments) >= 4 {
+			// TODO: Proper handling of arguments checking
+			duration, err := strconv.Atoi(command.arguments[3])
+
+			if err != nil {
+				respondToBadCommand(conn, command)
+				return
+			}
+
+			if strings.ToUpper(command.arguments[2]) == "PX" {
+				t := time.Now().Add(time.Duration(duration) * time.Millisecond)
+				expiry = &t
+			} else if strings.ToUpper(command.arguments[2]) == "EX" {
+				t := time.Now().Add(time.Duration(duration) * time.Second)
+				expiry = &t
+			}
+
+			// TODO: Send to the Reaper
+		}
+
+		value := rdb.ValueEntry{
+			Key:    command.arguments[0],
+			Value:  command.arguments[1],
+			Expiry: expiry,
+		}
+
+		state.mutex.Lock()
+		state.values[value.Key] = value
+		state.mutex.Unlock()
+
+		conn.Write([]byte(protocol.EncodeString("OK")))
+
+	case "GET":
+		if len(command.arguments) != 1 {
+			respondToBadCommand(conn, command)
+			return
+		}
+
+		state.mutex.RLock()
+		value, exists := state.values[command.arguments[0]]
+		state.mutex.RUnlock()
+
+		if exists && (value.Expiry == nil || value.Expiry.After(time.Now())) {
+			conn.Write([]byte(protocol.EncodeBulkString(value.Value)))
+		} else {
+			conn.Write([]byte(protocol.EncodeNullBulkString()))
+		}
+		// TODO: Send to the Reaper
+
+	case "KEYS":
+		state.mutex.RLock()
+		keys := make([]string, len(state.values))
+
+		i := 0
+		for k := range state.values {
+			keys[i] = k
+			i++
+		}
+
+		state.mutex.RUnlock()
+
+		conn.Write([]byte(protocol.EncodeArray(keys)))
+
+	case "CONFIG":
+		if len(command.arguments) == 2 && strings.ToUpper(command.arguments[0]) == "GET" {
+			value, exists := state.config[command.arguments[1]]
+
+			if exists {
+				conn.Write([]byte(protocol.EncodeArray([]string{command.arguments[1], value})))
+			} else {
+				conn.Write([]byte(protocol.EncodeNullBulkString()))
+			}
+		} else {
+			respondToBadCommand(conn, command)
+		}
+
+	default:
+		respondToBadCommand(conn, command)
+	}
+}
+
 func handleConnection(conn net.Conn, state *ServerState) {
 	defer conn.Close()
 
@@ -86,128 +245,13 @@ func handleConnection(conn net.Conn, state *ServerState) {
 	addr := conn.RemoteAddr().String()
 
 	for {
-		// For now, assume command is sent as a Bulk String
-
 		// Peek the first character to determine the datatype being sent
-		c, err := reader.Peek(1)
+		command, err := receiveCommand(reader)
 
 		if checkReadError(err, addr) {
 			return
 		}
 
-		var rawCommand = []string{}
-
-		switch string(c) {
-		// Read standard Array commands format
-		case "*":
-			rawCommand, err = ReadArray(reader)
-
-			if checkReadError(err, addr) {
-				return
-			}
-		// Fallback to inline commands format
-		default:
-			rawLine, err := ReadLine(reader)
-
-			if checkReadError(err, addr) {
-				return
-			}
-
-			rawCommand = strings.Split(rawLine, " ")
-		}
-
-		command := strings.ToUpper(rawCommand[0])
-		log.Printf("[%s] Received command %s", addr, command)
-
-		switch command {
-		case "PING":
-			conn.Write([]byte(EncodeString("PONG")))
-
-		case "ECHO":
-			if len(rawCommand) != 2 {
-				log.Printf("[%s] Malformed ECHO request: %#v", addr, rawCommand)
-				conn.Write([]byte(EncodeError("Malformed request.")))
-				continue
-			}
-
-			conn.Write([]byte(EncodeBulkString(rawCommand[1])))
-
-		case "SET":
-			if len(rawCommand) < 3 {
-				log.Printf("[%s] Malformed SET request: %#v", addr, rawCommand)
-				conn.Write([]byte(EncodeError("Malformed request.")))
-				continue
-			}
-
-			value := ValueEntry{
-				key:    rawCommand[1],
-				value:  rawCommand[2],
-				expiry: nil,
-			}
-
-			if len(rawCommand) >= 5 {
-				// TODO: Proper handling of arguments checking
-				expiry, err := strconv.Atoi(rawCommand[4])
-
-				if err != nil {
-					log.Printf("[%s] Malformed SET request: %#v", addr, rawCommand)
-					conn.Write([]byte(EncodeError("Malformed request.")))
-					continue
-				}
-
-				if strings.ToUpper(rawCommand[3]) == "PX" {
-					t := time.Now().Add(time.Duration(expiry) * time.Millisecond)
-					value.expiry = &t
-				} else if strings.ToUpper(rawCommand[3]) == "EX" {
-					t := time.Now().Add(time.Duration(expiry) * time.Second)
-					value.expiry = &t
-				}
-
-				// TODO: Send to the Reaper
-			}
-
-			state.mutex.Lock()
-			state.values[value.key] = value
-			state.mutex.Unlock()
-
-			conn.Write([]byte(EncodeString("OK")))
-
-		case "GET":
-			if len(rawCommand) != 2 {
-				log.Printf("[%s] Malformed GET request: %#v", addr, rawCommand)
-				conn.Write([]byte(EncodeError("Malformed request.")))
-				continue
-			}
-
-			state.mutex.RLock()
-			value, exists := state.values[rawCommand[1]]
-			state.mutex.RUnlock()
-
-			if exists && (value.expiry == nil || value.expiry.After(time.Now())) {
-				conn.Write([]byte(EncodeBulkString(value.value)))
-			} else {
-				conn.Write([]byte(EncodeNullBulkString()))
-			}
-			// TODO: Send to the Reaper
-
-		case "CONFIG":
-			if len(rawCommand) == 3 && strings.ToUpper(rawCommand[1]) == "GET" {
-				value, exists := state.config[rawCommand[2]]
-
-				if exists {
-					conn.Write([]byte(EncodeArray([]string{rawCommand[2], value})))
-				} else {
-					conn.Write([]byte(EncodeNullBulkString()))
-				}
-			} else {
-				log.Printf("[%s] Malformed GET request: %#v", addr, rawCommand)
-				conn.Write([]byte(EncodeError("Malformed request.")))
-				continue
-			}
-
-		default:
-			log.Printf("[%s] Unknown command '%s'", addr, command)
-			conn.Write([]byte(EncodeError("Unknown Command")))
-		}
+		processCommand(conn, command, state)
 	}
 }
