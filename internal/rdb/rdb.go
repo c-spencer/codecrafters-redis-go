@@ -3,6 +3,8 @@ package rdb
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strconv"
@@ -34,6 +36,64 @@ func TypeToString(t int) string {
 	default:
 		return "unknown"
 	}
+}
+
+type Stream struct {
+	Entries []*StreamEntry
+}
+
+type StreamEntry struct {
+	Id         EntryId
+	Properties map[string]string
+}
+
+type EntryId struct {
+	MilliTime      int
+	SequenceNumber int
+}
+
+func EntryIdFromString(s string) (*EntryId, error) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid entry ID format")
+	}
+
+	milli, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid millisecond time: %v", err)
+	}
+
+	seq, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid sequence number: %v", err)
+	}
+
+	entry := EntryId{
+		MilliTime:      milli,
+		SequenceNumber: seq,
+	}
+
+	return &entry, nil
+}
+
+func (e EntryId) String() string {
+	return fmt.Sprintf("%d-%d", e.MilliTime, e.SequenceNumber)
+}
+
+func (e EntryId) ValidateAgainstStream(s *Stream) error {
+	if e.MilliTime == 0 && e.SequenceNumber == 0 {
+		return errors.New("ERR The ID specified in XADD must be greater than 0-0")
+	}
+
+	if len(s.Entries) > 0 {
+		lastId := s.Entries[len(s.Entries)-1].Id
+
+		if e.MilliTime < lastId.MilliTime || e.SequenceNumber <= lastId.SequenceNumber {
+			return errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+		}
+	}
+
+	return nil
 }
 
 func readHeader(reader *bufio.Reader) int {

@@ -303,27 +303,63 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 		streamName := command.arguments[0]
 		// TODO: Handle missing entryId
-		entryId := command.arguments[1]
+		rawEntryId := command.arguments[1]
 
-		// Read pairs of arguments into a map
-		// TODO: Do something with them
-		args := map[string]string{}
+		// Read pairs of arguments into a map of properties for the entry
+		properties := map[string]string{}
 		for i := 2; i+1 < len(command.arguments); i += 2 {
-			args[command.arguments[i]] = command.arguments[i+1]
+			properties[command.arguments[i]] = command.arguments[i+1]
 		}
 
-		value := rdb.ValueEntry{
-			Key:    streamName,
-			Value:  nil,
-			Type:   rdb.TStream,
-			Expiry: nil,
+		entryId, err := rdb.EntryIdFromString(rawEntryId)
+
+		if err != nil {
+			result := protocol.EncodeError(err.Error())
+			return &result
+		}
+
+		entry := rdb.StreamEntry{
+			Id:         *entryId,
+			Properties: properties,
 		}
 
 		state.mutex.Lock()
-		state.values[value.Key] = &value
+
+		// Check that the stream key exists, and if not create it
+		value, exists := state.values[streamName]
+
+		if !exists {
+			stream := rdb.Stream{
+				Entries: []*rdb.StreamEntry{},
+			}
+
+			value = &rdb.ValueEntry{
+				Key:    streamName,
+				Value:  &stream,
+				Type:   rdb.TStream,
+				Expiry: nil,
+			}
+			state.values[value.Key] = value
+		} else {
+			// TODO: Validate it's a stream
+		}
+
+		// Now we know the value exists and is a stream
+		stream := value.Value.(*rdb.Stream)
+
+		// Validate the entryId is valid for the given stream
+		err = entryId.ValidateAgainstStream(value.Value.(*rdb.Stream))
+		if err != nil {
+			state.mutex.Unlock()
+			result := protocol.EncodeError(err.Error())
+			return &result
+		}
+
+		// Finally append the validated entry into the stream.
+		stream.Entries = append(stream.Entries, &entry)
 		state.mutex.Unlock()
 
-		result := protocol.EncodeString(entryId)
+		result := protocol.EncodeString(entry.Id.String())
 		return &result
 
 	case "TYPE":
