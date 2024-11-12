@@ -21,10 +21,15 @@ import (
 type ValueWatchChannel chan *rdb.ValueEntry
 
 type ServerState struct {
-	mutex    sync.RWMutex
-	values   map[string]*rdb.ValueEntry
-	config   map[string]string
-	watchers map[int]*ValueWatchChannel
+	mutex       sync.RWMutex
+	values      map[string]*rdb.ValueEntry
+	config      map[string]string
+	watchers    map[int]*ValueWatchChannel
+	replication *ReplicationState
+}
+
+type ReplicationState struct {
+	role string
 }
 
 func main() {
@@ -47,11 +52,16 @@ func main() {
 		"dbfilename": dbfilename,
 	}
 
+	replicationState := ReplicationState{
+		role: "master",
+	}
+
 	state := ServerState{
-		mutex:    sync.RWMutex{},
-		values:   map[string]*rdb.ValueEntry{},
-		config:   config,
-		watchers: map[int]*ValueWatchChannel{},
+		mutex:       sync.RWMutex{},
+		values:      map[string]*rdb.ValueEntry{},
+		config:      config,
+		watchers:    map[int]*ValueWatchChannel{},
+		replication: &replicationState,
 	}
 
 	db, err := rdb.LoadDatabase(path.Join(dir, dbfilename))
@@ -650,6 +660,17 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			result := protocol.EncodeString("none")
 			return &result
 		}
+
+	case "INFO":
+		if len(command.arguments) < 1 || command.arguments[0] != "replication" {
+			respondToBadCommand(conn, command)
+			return nil
+		}
+
+		info := fmt.Sprintf("role:%s", state.replication.role)
+
+		result := protocol.EncodeBulkString(info)
+		return &result
 
 	default:
 		respondToBadCommand(conn, command)
