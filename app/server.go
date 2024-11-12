@@ -95,6 +95,10 @@ func main() {
 
 	connCounter := 1
 
+	if replicaof != "" {
+		go replicator(replicaof, &state)
+	}
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -105,6 +109,25 @@ func main() {
 		go handleConnection(conn, connCounter, &state)
 
 		connCounter += 1
+	}
+}
+
+func replicator(replicaof string, state *ServerState) {
+	parts := strings.Split(replicaof, " ")
+
+	if len(parts) != 2 {
+		log.Fatalf("replicaof must be of form '<HOST> <PORT>', got '%s'", replicaof)
+	}
+
+	masterConn, err := net.Dial("tcp", strings.Join(parts, ":"))
+
+	if err != nil {
+		log.Fatalf("Got error connecting to master %#v", err)
+	}
+
+	masterConn.Write([]byte(protocol.EncodeArray([]string{"PING"})))
+
+	for {
 	}
 }
 
