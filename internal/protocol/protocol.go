@@ -96,6 +96,18 @@ func ReadBulkString(reader *bufio.Reader) (string, error) {
 	return string(buf[:length]), nil
 }
 
+// ReadString reads a simple string from the reader
+func ReadString(reader *bufio.Reader) (string, error) {
+	line, err := ReadLine(reader)
+	if err != nil {
+		return "", err
+	}
+	if len(line) < 1 || line[0] != '+' {
+		return "", fmt.Errorf("invalid simple string format")
+	}
+	return line[1:], nil
+}
+
 // ReadArray reads an array from the reader
 func ReadArray(reader *bufio.Reader) ([]string, error) {
 	length, err := parseLengthLine(reader, "*%d")
