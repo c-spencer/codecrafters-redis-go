@@ -503,6 +503,11 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			streamNames = append(streamNames, streamName)
 			rawStart := command.arguments[argumentOffset+i+pairs]
 
+			// If the start is '$', skip here so the later blocking logic can take over.
+			if rawStart == "$" {
+				continue
+			}
+
 			log.Printf("XREAD %s %s", streamName, rawStart)
 
 			value, exists := state.values[streamName]
