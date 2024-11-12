@@ -36,6 +36,7 @@ func main() {
 	dir := "/tmp"
 	dbfilename := "dump.rdb"
 	port := 6379
+	replicaof := ""
 
 	for i, arg := range os.Args {
 		if arg == "--dir" && i+1 < len(os.Args) {
@@ -44,6 +45,8 @@ func main() {
 			dbfilename = os.Args[i+1]
 		} else if arg == "--port" && i+1 < len(os.Args) {
 			port, _ = strconv.Atoi(os.Args[i+1])
+		} else if arg == "--replicaof" && i+1 < len(os.Args) {
+			replicaof = os.Args[i+1]
 		}
 	}
 
@@ -52,8 +55,13 @@ func main() {
 		"dbfilename": dbfilename,
 	}
 
+	role := "master"
+	if replicaof != "" {
+		role = "slave"
+	}
+
 	replicationState := ReplicationState{
-		role: "master",
+		role: role,
 	}
 
 	state := ServerState{
