@@ -396,12 +396,25 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		// Parse the starting point, allowing "-" as from the beginning.
 		var start *rdb.EntryId = nil
 		if rawStart == "-" {
-			start, _ = rdb.EntryIdFromString("0-0", stream)
+			start = &rdb.EntryId{
+				MilliTime:      0,
+				SequenceNumber: 0,
+			}
 		} else {
 			start, _ = rdb.EntryIdFromString(rawStart, stream)
 		}
 
-		end, _ := rdb.EntryIdFromString(rawEnd, stream)
+		// Parse the ending point, allowing "+" as until the end
+		var end *rdb.EntryId = nil
+		if rawEnd == "+" {
+			// Use max ints
+			end = &rdb.EntryId{
+				MilliTime:      int(^uint(0) >> 1),
+				SequenceNumber: int(^uint(0) >> 1),
+			}
+		} else {
+			end, _ = rdb.EntryIdFromString(rawEnd, stream)
+		}
 
 		resp := []*string{}
 
