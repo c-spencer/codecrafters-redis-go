@@ -474,7 +474,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		}
 
 		argumentOffset := 0
-		blocking := 0
+		blocking := -1
 
 		if strings.ToUpper(command.arguments[0]) == "BLOCK" {
 			argumentOffset += 2
@@ -552,7 +552,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		// If we're blocking and no results were found, insert a channel to watch
 		// for changes on.
 		var watchChannel *ValueWatchChannel = nil
-		if len(streamsResults) == 0 && blocking != 0 {
+		if len(streamsResults) == 0 && blocking != -1 {
 			c := make(ValueWatchChannel)
 			watchChannel = &c
 			state.watchers[conn.id] = watchChannel
@@ -562,7 +562,11 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 		// If we opened a watch channel, wait on that channel for changes
 		if watchChannel != nil {
-			timeoutChannel := time.After(time.Duration(blocking) * time.Millisecond)
+			// Create a dummy timeout channel and replace if blocking is set to non-zero.
+			timeoutChannel := make(<-chan time.Time)
+			if blocking > 0 {
+				timeoutChannel = time.After(time.Duration(blocking) * time.Millisecond)
+			}
 
 			var result *rdb.ValueEntry = nil
 
