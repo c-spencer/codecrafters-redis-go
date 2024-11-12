@@ -777,8 +777,14 @@ func handleConnection(conn net.Conn, connId int, state *ServerState) {
 			return
 		}
 
-		// Meta commands dealing with Transactions
-		if command.name == "MULTI" {
+		// Meta commands for Replication
+		if command.name == "REPLCONF" {
+			// TODO: Actual implementation
+			conn.Write([]byte(protocol.EncodeString("OK")))
+
+			// Meta commands dealing with Transactions
+		} else if command.name == "MULTI" {
+
 			connState.isBuffering = true
 			conn.Write([]byte(protocol.EncodeString("OK")))
 		} else if command.name == "DISCARD" {
