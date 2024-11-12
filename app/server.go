@@ -188,6 +188,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		value := rdb.ValueEntry{
 			Key:    command.arguments[0],
 			Value:  command.arguments[1],
+			Type:   rdb.TString,
 			Expiry: expiry,
 		}
 
@@ -266,6 +267,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			value := rdb.ValueEntry{
 				Key:    command.arguments[0],
 				Value:  "1",
+				Type:   rdb.TString,
 				Expiry: nil,
 			}
 
@@ -292,6 +294,37 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			respondToBadCommand(conn, command)
 			return nil
 		}
+
+	case "XADD":
+		if len(command.arguments) < 2 {
+			respondToBadCommand(conn, command)
+			return nil
+		}
+
+		streamName := command.arguments[0]
+		// TODO: Handle missing entryId
+		entryId := command.arguments[1]
+
+		// Read pairs of arguments into a map
+		// TODO: Do something with them
+		args := map[string]string{}
+		for i := 2; i+1 < len(command.arguments); i += 2 {
+			args[command.arguments[i]] = command.arguments[i+1]
+		}
+
+		value := rdb.ValueEntry{
+			Key:    streamName,
+			Value:  nil,
+			Type:   rdb.TStream,
+			Expiry: nil,
+		}
+
+		state.mutex.Lock()
+		state.values[value.Key] = &value
+		state.mutex.Unlock()
+
+		result := protocol.EncodeString(entryId)
+		return &result
 
 	case "TYPE":
 		if len(command.arguments) < 1 {

@@ -20,6 +20,7 @@ type ValueEntry struct {
 const (
 	TString = iota
 	TSet    = iota
+	TStream = iota
 )
 
 func TypeToString(t int) string {
@@ -28,6 +29,8 @@ func TypeToString(t int) string {
 		return "string"
 	case TSet:
 		return "set"
+	case TStream:
+		return "stream"
 	default:
 		return "unknown"
 	}
