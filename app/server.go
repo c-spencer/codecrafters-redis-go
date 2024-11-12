@@ -251,8 +251,8 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 			if err != nil {
 				state.mutex.Unlock()
-				conn.conn.Write([]byte(protocol.EncodeError("ERR value is not an integer or out of range")))
-				return nil
+				result := protocol.EncodeError("ERR value is not an integer or out of range")
+				return &result
 			}
 
 			x += 1
