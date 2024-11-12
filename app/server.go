@@ -781,6 +781,15 @@ func handleConnection(conn net.Conn, connId int, state *ServerState) {
 		if command.name == "REPLCONF" {
 			// TODO: Actual implementation
 			conn.Write([]byte(protocol.EncodeString("OK")))
+		} else if command.name == "PSYNC" {
+			if len(command.arguments) < 2 || command.arguments[0] != "?" || command.arguments[1] != "-1" {
+				log.Printf("Got unexpected PSYNC arguments: %#v", command.arguments)
+				conn.Write([]byte(protocol.EncodeError("Unexpected PSYNC arguments")))
+			} else {
+				conn.Write([]byte(protocol.EncodeString(
+					fmt.Sprintf("FULLRESYNC %s %d", state.replication.master_replid, 0),
+				)))
+			}
 
 			// Meta commands dealing with Transactions
 		} else if command.name == "MULTI" {
