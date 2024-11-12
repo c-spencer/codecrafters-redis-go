@@ -452,6 +452,79 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		result := protocol.EncodeEncodedArray(resp)
 		return &result
 
+	case "XREAD":
+		if len(command.arguments) < 3 || strings.ToUpper(command.arguments[0]) != "STREAMS" {
+			respondToBadCommand(conn, command)
+			return nil
+		}
+
+		streamName := command.arguments[1]
+		rawStart := command.arguments[2]
+
+		state.mutex.RLock()
+
+		value, exists := state.values[streamName]
+
+		if !exists {
+			// TODO
+			state.mutex.RUnlock()
+			return nil
+		} else if value.Type != rdb.TStream {
+			// TODO
+			state.mutex.RUnlock()
+			return nil
+		}
+
+		stream := value.Value.(*rdb.Stream)
+		// TODO: Handle errors
+
+		start, _ := rdb.EntryIdFromString(rawStart, stream)
+
+		// Stream results holds the (entry-id, properties) pairs that have been
+		// encoded into an Array string
+		streamResults := []*string{}
+
+		// TODO: Binary search for the starting point.
+		for i := range stream.Entries {
+			entry := stream.Entries[i]
+			// If entry
+			if entry.Id.MilliTime < start.MilliTime || (entry.Id.MilliTime == start.MilliTime && entry.Id.SequenceNumber <= start.SequenceNumber) {
+				continue
+			}
+
+			id := protocol.EncodeString(entry.Id.String())
+
+			props := []string{}
+
+			for j := range entry.Properties {
+				props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
+			}
+
+			encodedProps := protocol.EncodeArray(props)
+
+			entryEncoded := protocol.EncodeEncodedArray([]*string{
+				&id,
+				&encodedProps,
+			})
+
+			streamResults = append(streamResults, &entryEncoded)
+		}
+
+		state.mutex.RUnlock()
+
+		// resp is constructed to hold the (stream-id, entries) pair, encoded as
+		// an Array string.
+		streamNameEncoded := protocol.EncodeString(streamName)
+		streamResultsEncoded := protocol.EncodeEncodedArray(streamResults)
+		resp := protocol.EncodeEncodedArray([]*string{
+			&streamNameEncoded,
+			&streamResultsEncoded,
+		})
+
+		// The final result is then the encoding of resp inside a top level array.
+		result := protocol.EncodeEncodedArray([]*string{&resp})
+		return &result
+
 	case "TYPE":
 		if len(command.arguments) < 1 {
 			respondToBadCommand(conn, command)
