@@ -29,7 +29,9 @@ type ServerState struct {
 }
 
 type ReplicationState struct {
-	role string
+	role               string
+	master_replid      string
+	master_repl_offset int
 }
 
 func main() {
@@ -61,7 +63,9 @@ func main() {
 	}
 
 	replicationState := ReplicationState{
-		role: role,
+		role:               role,
+		master_replid:      "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+		master_repl_offset: 0,
 	}
 
 	state := ServerState{
@@ -675,7 +679,13 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			return nil
 		}
 
-		info := fmt.Sprintf("role:%s", state.replication.role)
+		info := strings.Join(
+			[]string{
+				fmt.Sprintf("role:%s", state.replication.role),
+				fmt.Sprintf("master_replid:%s", state.replication.master_replid),
+				fmt.Sprintf("master_repl_offset:%d", state.replication.master_repl_offset),
+			}, "\r\n",
+		)
 
 		result := protocol.EncodeBulkString(info)
 		return &result
