@@ -30,12 +30,15 @@ type ServerState struct {
 func main() {
 	dir := "/tmp"
 	dbfilename := "dump.rdb"
+	port := 6379
 
 	for i, arg := range os.Args {
 		if arg == "--dir" && i+1 < len(os.Args) {
 			dir = os.Args[i+1]
 		} else if arg == "--dbfilename" && i+1 < len(os.Args) {
 			dbfilename = os.Args[i+1]
+		} else if arg == "--port" && i+1 < len(os.Args) {
+			port, _ = strconv.Atoi(os.Args[i+1])
 		}
 	}
 
@@ -62,9 +65,9 @@ func main() {
 	fmt.Println("Logs from your program will appear here.")
 
 	// Bind to port
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		log.Println("Failed to bind to port 6379")
+		log.Printf("Failed to bind to port %d\n", port)
 		os.Exit(1)
 	}
 
