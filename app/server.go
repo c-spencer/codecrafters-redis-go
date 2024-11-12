@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -97,7 +99,10 @@ func main() {
 	connCounter := 1
 
 	if replicaof != "" {
-		go replicator(replicaof, &state)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go replicator(replicaof, &state, &wg)
+		wg.Wait()
 	}
 
 	for {
@@ -113,7 +118,7 @@ func main() {
 	}
 }
 
-func replicator(replicaof string, state *ServerState) {
+func replicator(replicaof string, state *ServerState, wg *sync.WaitGroup) {
 	parts := strings.Split(replicaof, " ")
 
 	if len(parts) != 2 {
@@ -164,6 +169,19 @@ func replicator(replicaof string, state *ServerState) {
 	resp, _ = protocol.ReadString(reader)
 
 	log.Printf("[replicator] Got PSYNC response: %s", resp)
+
+	dbfile, _ := protocol.ReadBytes(reader)
+
+	log.Printf("Received dbfile of length %d", len(dbfile))
+
+	db, err := rdb.LoadDatabaseFromReader(bytes.NewReader(dbfile))
+	if err == nil {
+		state.mutex.Lock()
+		state.values = db.Hashtable
+		state.mutex.Unlock()
+	}
+
+	wg.Done()
 
 	for {
 	}
@@ -789,6 +807,10 @@ func handleConnection(conn net.Conn, connId int, state *ServerState) {
 				conn.Write([]byte(protocol.EncodeString(
 					fmt.Sprintf("FULLRESYNC %s %d", state.replication.master_replid, 0),
 				)))
+
+				dbbytes, _ := hex.DecodeString(rdb.EmptyHexDatabase)
+
+				conn.Write([]byte(protocol.EncodeBytes(dbbytes)))
 			}
 
 			// Meta commands dealing with Transactions

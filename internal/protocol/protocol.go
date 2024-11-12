@@ -51,6 +51,11 @@ func EncodeEncodedArray(values []string) string {
 	return buffer.String()
 }
 
+// EncodeBytes encodes a byte slice in Redis protocol
+func EncodeBytes(value []byte) string {
+	return fmt.Sprintf("$%d\r\n%s", len(value), value)
+}
+
 // ReadLine reads a single line from the reader
 func ReadLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
@@ -94,6 +99,24 @@ func ReadBulkString(reader *bufio.Reader) (string, error) {
 		return "", err
 	}
 	return string(buf[:length]), nil
+}
+
+func ReadBytes(reader *bufio.Reader) ([]byte, error) {
+	length, err := parseLengthLine(reader, "$%d")
+	if err != nil {
+		return []byte{}, err
+	}
+	if length == -1 {
+		return []byte{}, nil // Null binary
+	}
+
+	buf := make([]byte, length)
+	_, err = reader.Read(buf)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	return buf, nil
 }
 
 // ReadString reads a simple string from the reader

@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
+
+const EmptyHexDatabase = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
 
 type ValueEntry struct {
 	Key    string
@@ -188,7 +191,8 @@ func readMetadata(reader *bufio.Reader) map[string]string {
 		if err != nil {
 			panic("Couldn't peek reader")
 		}
-		if peeked[0] == 0xFE {
+
+		if peeked[0] >= 0xFE {
 			break
 		} else if peeked[0] == 0xFA {
 			reader.Discard(1)
@@ -198,6 +202,8 @@ func readMetadata(reader *bufio.Reader) map[string]string {
 		value := readString(reader)
 
 		metadata[name] = value
+
+		log.Printf("%s = %s", name, value)
 	}
 
 	return metadata
@@ -247,8 +253,11 @@ func readSize(reader *bufio.Reader) (int, bool) {
 
 func readDatabase(reader *bufio.Reader) map[string]*ValueEntry {
 	b, err := reader.ReadByte()
-	if err != nil || b != 0xFE {
+	if err != nil || b < 0xFE {
 		panic("Expected 0xFE marker byte as database section marker")
+	} else if b == 0xFF {
+		// Empty database with no database section
+		return map[string]*ValueEntry{}
 	}
 
 	readSize(reader) // Skip databaseIndex
@@ -352,11 +361,15 @@ func LoadDatabase(path string) (*LoadedDatabase, error) {
 	}
 	defer file.Close()
 
-	reader := bufio.NewReader(file)
+	return LoadDatabaseFromReader(file)
+}
 
-	version := readHeader(reader)
-	metadata := readMetadata(reader)
-	hashtable := readDatabase(reader)
+func LoadDatabaseFromReader(reader io.Reader) (*LoadedDatabase, error) {
+	bufReader := bufio.NewReader(reader)
+
+	version := readHeader(bufReader)
+	metadata := readMetadata(bufReader)
+	hashtable := readDatabase(bufReader)
 
 	return &LoadedDatabase{
 		Version:   version,
