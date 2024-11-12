@@ -143,19 +143,7 @@ type ConnState struct {
 func processCommand(conn *ConnState, command *Command, state *ServerState) {
 	log.Printf("[%s] Received command %s", conn.addr, command.name)
 
-	if conn.isBuffering && command.name != "EXEC" {
-		conn.buffer = append(conn.buffer, command)
-		conn.conn.Write([]byte(protocol.EncodeString("QUEUED")))
-		return
-	}
-
 	switch command.name {
-	case "EXEC":
-		if !conn.isBuffering {
-			conn.conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
-			return
-		}
-
 	case "PING":
 		conn.conn.Write([]byte(protocol.EncodeString("PONG")))
 
@@ -321,6 +309,24 @@ func handleConnection(conn net.Conn, state *ServerState) {
 			return
 		}
 
-		processCommand(&connState, command, state)
+		if command.name == "MULTI" {
+			connState.isBuffering = true
+			connState.conn.Write([]byte(protocol.EncodeString("OK")))
+		} else if command.name == "EXEC" {
+			if !connState.isBuffering {
+				connState.conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
+				return
+			}
+			// TODO: Execute commands
+
+			connState.conn.Write([]byte(protocol.EncodeArray([]string{})))
+			connState.buffer = []*Command{}
+			connState.isBuffering = false
+		} else if connState.isBuffering {
+			connState.buffer = append(connState.buffer, command)
+			connState.conn.Write([]byte(protocol.EncodeString("QUEUED")))
+		} else {
+			processCommand(&connState, command, state)
+		}
 	}
 }
