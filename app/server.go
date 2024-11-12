@@ -458,71 +458,84 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 			return nil
 		}
 
-		streamName := command.arguments[1]
-		rawStart := command.arguments[2]
-
 		state.mutex.RLock()
 
-		value, exists := state.values[streamName]
+		pairs := (len(command.arguments) - 1) / 2
 
-		if !exists {
-			// TODO
-			state.mutex.RUnlock()
-			return nil
-		} else if value.Type != rdb.TStream {
-			// TODO
-			state.mutex.RUnlock()
-			return nil
-		}
+		// streamsResults holds all pairs of (stream id, entry results)
+		streamsResults := []*string{}
 
-		stream := value.Value.(*rdb.Stream)
-		// TODO: Handle errors
+		// Streams and starting points are send as (a, b, c, a-start, b-start, c-start)
+		// So for given pair, the start is at i and i+pairCount (offset by 1 for the STREAMS keyword)
+		for i := 0; i < pairs; i++ {
+			streamName := command.arguments[1+i]
+			rawStart := command.arguments[1+i+pairs]
 
-		start, _ := rdb.EntryIdFromString(rawStart, stream)
+			log.Printf("XREAD %s %s", streamName, rawStart)
 
-		// Stream results holds the (entry-id, properties) pairs that have been
-		// encoded into an Array string
-		streamResults := []*string{}
+			value, exists := state.values[streamName]
 
-		// TODO: Binary search for the starting point.
-		for i := range stream.Entries {
-			entry := stream.Entries[i]
-			// If entry
-			if entry.Id.MilliTime < start.MilliTime || (entry.Id.MilliTime == start.MilliTime && entry.Id.SequenceNumber <= start.SequenceNumber) {
-				continue
+			if !exists {
+				// TODO
+				state.mutex.RUnlock()
+				return nil
+			} else if value.Type != rdb.TStream {
+				// TODO
+				state.mutex.RUnlock()
+				return nil
 			}
 
-			id := protocol.EncodeString(entry.Id.String())
+			stream := value.Value.(*rdb.Stream)
+			// TODO: Handle errors
 
-			props := []string{}
+			start, _ := rdb.EntryIdFromString(rawStart, stream)
 
-			for j := range entry.Properties {
-				props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
+			// Stream results holds the (entry-id, properties) pairs that have been
+			// encoded into an Array string
+			streamResults := []*string{}
+
+			// TODO: Binary search for the starting point.
+			for i := range stream.Entries {
+				entry := stream.Entries[i]
+				// If entry
+				if entry.Id.MilliTime < start.MilliTime || (entry.Id.MilliTime == start.MilliTime && entry.Id.SequenceNumber <= start.SequenceNumber) {
+					continue
+				}
+
+				id := protocol.EncodeString(entry.Id.String())
+
+				props := []string{}
+
+				for j := range entry.Properties {
+					props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
+				}
+
+				encodedProps := protocol.EncodeArray(props)
+
+				entryEncoded := protocol.EncodeEncodedArray([]*string{
+					&id,
+					&encodedProps,
+				})
+
+				streamResults = append(streamResults, &entryEncoded)
 			}
 
-			encodedProps := protocol.EncodeArray(props)
-
-			entryEncoded := protocol.EncodeEncodedArray([]*string{
-				&id,
-				&encodedProps,
+			// result is constructed to hold the (stream-id, entries) pair, encoded as
+			// an Array string.
+			streamNameEncoded := protocol.EncodeString(streamName)
+			streamResultsEncoded := protocol.EncodeEncodedArray(streamResults)
+			result := protocol.EncodeEncodedArray([]*string{
+				&streamNameEncoded,
+				&streamResultsEncoded,
 			})
 
-			streamResults = append(streamResults, &entryEncoded)
+			streamsResults = append(streamsResults, &result)
 		}
 
 		state.mutex.RUnlock()
 
-		// resp is constructed to hold the (stream-id, entries) pair, encoded as
-		// an Array string.
-		streamNameEncoded := protocol.EncodeString(streamName)
-		streamResultsEncoded := protocol.EncodeEncodedArray(streamResults)
-		resp := protocol.EncodeEncodedArray([]*string{
-			&streamNameEncoded,
-			&streamResultsEncoded,
-		})
-
 		// The final result is then the encoding of resp inside a top level array.
-		result := protocol.EncodeEncodedArray([]*string{&resp})
+		result := protocol.EncodeEncodedArray(streamsResults)
 		return &result
 
 	case "TYPE":
