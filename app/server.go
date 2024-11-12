@@ -324,19 +324,19 @@ func handleConnection(conn net.Conn, state *ServerState) {
 		// Meta commands dealing with Transactions
 		if command.name == "MULTI" {
 			connState.isBuffering = true
-			connState.conn.Write([]byte(protocol.EncodeString("OK")))
+			conn.Write([]byte(protocol.EncodeString("OK")))
 		} else if command.name == "DISCARD" {
 			if !connState.isBuffering {
-				connState.conn.Write([]byte(protocol.EncodeError("ERR DISCARD without MULTI")))
+				conn.Write([]byte(protocol.EncodeError("ERR DISCARD without MULTI")))
 				return
 			}
 
 			connState.buffer = []*Command{}
 			connState.isBuffering = false
-			connState.conn.Write([]byte(protocol.EncodeString("OK")))
+			conn.Write([]byte(protocol.EncodeString("OK")))
 		} else if command.name == "EXEC" {
 			if !connState.isBuffering {
-				connState.conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
+				conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
 				return
 			}
 
@@ -348,16 +348,18 @@ func handleConnection(conn net.Conn, state *ServerState) {
 
 			// As the return values of processCommand are themselves already encoded, just encode
 			// the outer Array wrapper to return the values.
-			connState.conn.Write([]byte(protocol.EncodeEncodedArray(results)))
+			conn.Write([]byte(protocol.EncodeEncodedArray(results)))
 
 			connState.buffer = []*Command{}
 			connState.isBuffering = false
 		} else if connState.isBuffering {
+			// Queue commands while buffering
 			connState.buffer = append(connState.buffer, command)
-			connState.conn.Write([]byte(protocol.EncodeString("QUEUED")))
+			conn.Write([]byte(protocol.EncodeString("QUEUED")))
 		} else {
+			// Otherwise just execute as we receive.
 			result := processCommand(&connState, command, state)
-			connState.conn.Write([]byte(*result))
+			conn.Write([]byte(*result))
 		}
 	}
 }
