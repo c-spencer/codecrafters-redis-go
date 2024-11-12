@@ -305,10 +305,13 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		// TODO: Handle missing entryId
 		rawEntryId := command.arguments[1]
 
-		// Read pairs of arguments into a map of properties for the entry
-		properties := map[string]string{}
+		// Read pairs of arguments into properties for the entry
+		properties := []rdb.StreamEntryProperty{}
 		for i := 2; i+1 < len(command.arguments); i += 2 {
-			properties[command.arguments[i]] = command.arguments[i+1]
+			properties = append(properties, rdb.StreamEntryProperty{
+				Key:   command.arguments[i],
+				Value: command.arguments[i+1],
+			})
 		}
 
 		state.mutex.Lock()
@@ -361,6 +364,71 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		state.mutex.Unlock()
 
 		result := protocol.EncodeBulkString(entry.Id.String())
+		return &result
+
+	case "XRANGE":
+		if len(command.arguments) < 3 {
+			respondToBadCommand(conn, command)
+			return nil
+		}
+
+		streamName := command.arguments[0]
+		rawStart := command.arguments[1]
+		rawEnd := command.arguments[2]
+
+		state.mutex.RLock()
+
+		value, exists := state.values[streamName]
+
+		if !exists {
+			// TODO
+			state.mutex.RUnlock()
+			return nil
+		} else if value.Type != rdb.TStream {
+			// TODO
+			state.mutex.RUnlock()
+			return nil
+		}
+
+		stream := value.Value.(*rdb.Stream)
+		// TODO: Handle errors
+		start, _ := rdb.EntryIdFromString(rawStart, stream)
+		end, _ := rdb.EntryIdFromString(rawEnd, stream)
+
+		resp := []*string{}
+
+		// TODO: Binary search for the starting point.
+		for i := range stream.Entries {
+			entry := stream.Entries[i]
+			// If entry
+			if entry.Id.MilliTime < start.MilliTime || (entry.Id.MilliTime == start.MilliTime && entry.Id.SequenceNumber < start.SequenceNumber) {
+				continue
+			}
+			if entry.Id.MilliTime > end.MilliTime || (entry.Id.MilliTime == end.MilliTime && entry.Id.SequenceNumber > end.SequenceNumber) {
+				break
+			}
+
+			id := protocol.EncodeString(entry.Id.String())
+
+			props := []string{}
+
+			for j := range entry.Properties {
+				props = append(props, entry.Properties[j].Key, entry.Properties[j].Value)
+			}
+
+			encodedProps := protocol.EncodeArray(props)
+
+			entryEncoded := protocol.EncodeEncodedArray([]*string{
+				&id,
+				&encodedProps,
+			})
+
+			resp = append(resp, &entryEncoded)
+		}
+
+		state.mutex.RUnlock()
+
+		result := protocol.EncodeEncodedArray(resp)
 		return &result
 
 	case "TYPE":

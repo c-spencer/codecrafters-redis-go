@@ -44,7 +44,12 @@ type Stream struct {
 
 type StreamEntry struct {
 	Id         EntryId
-	Properties map[string]string
+	Properties []StreamEntryProperty
+}
+
+type StreamEntryProperty struct {
+	Key   string
+	Value string
 }
 
 type EntryId struct {
