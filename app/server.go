@@ -86,9 +86,9 @@ func checkReadError(err error, addr string) bool {
 	return false
 }
 
-func respondToBadCommand(conn net.Conn, command *Command) {
-	log.Printf("[%s] Malformed %s request: %#v", conn.RemoteAddr().String(), command.name, command)
-	conn.Write([]byte(protocol.EncodeError("Malformed request.")))
+func respondToBadCommand(conn *ConnState, command *Command) {
+	log.Printf("[%s] Malformed %s request: %#v", conn.addr, command.name, command)
+	conn.conn.Write([]byte(protocol.EncodeError("Malformed request.")))
 }
 
 type Command struct {
@@ -133,13 +133,25 @@ func receiveCommand(reader *bufio.Reader) (*Command, error) {
 	return &command, nil
 }
 
-func processCommand(conn net.Conn, command *Command, state *ServerState) {
-	addr := conn.RemoteAddr().String()
-	log.Printf("[%s] Received command %s", addr, command.name)
+type ConnState struct {
+	conn        net.Conn
+	isBuffering bool
+	buffer      []*Command
+	addr        string
+}
+
+func processCommand(conn *ConnState, command *Command, state *ServerState) {
+	log.Printf("[%s] Received command %s", conn.addr, command.name)
+
+	if conn.isBuffering {
+		conn.buffer = append(conn.buffer, command)
+		conn.conn.Write([]byte(protocol.EncodeString("QUEUED")))
+		return
+	}
 
 	switch command.name {
 	case "PING":
-		conn.Write([]byte(protocol.EncodeString("PONG")))
+		conn.conn.Write([]byte(protocol.EncodeString("PONG")))
 
 	case "ECHO":
 		if len(command.arguments) != 1 {
@@ -147,7 +159,7 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 			return
 		}
 
-		conn.Write([]byte(protocol.EncodeBulkString(command.arguments[0])))
+		conn.conn.Write([]byte(protocol.EncodeBulkString(command.arguments[0])))
 
 	case "SET":
 		if len(command.arguments) < 2 {
@@ -187,7 +199,7 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 		state.values[value.Key] = &value
 		state.mutex.Unlock()
 
-		conn.Write([]byte(protocol.EncodeString("OK")))
+		conn.conn.Write([]byte(protocol.EncodeString("OK")))
 
 	case "GET":
 		if len(command.arguments) != 1 {
@@ -200,9 +212,9 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 		state.mutex.RUnlock()
 
 		if exists && (value.Expiry == nil || value.Expiry.After(time.Now())) {
-			conn.Write([]byte(protocol.EncodeBulkString(value.Value)))
+			conn.conn.Write([]byte(protocol.EncodeBulkString(value.Value)))
 		} else {
-			conn.Write([]byte(protocol.EncodeNullBulkString()))
+			conn.conn.Write([]byte(protocol.EncodeNullBulkString()))
 		}
 		// TODO: Send to the Reaper
 
@@ -218,7 +230,7 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 
 		state.mutex.RUnlock()
 
-		conn.Write([]byte(protocol.EncodeArray(keys)))
+		conn.conn.Write([]byte(protocol.EncodeArray(keys)))
 
 	case "INCR":
 		if len(command.arguments) < 1 {
@@ -239,7 +251,7 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 
 			if err != nil {
 				state.mutex.Unlock()
-				conn.Write([]byte(protocol.EncodeError("ERR value is not an integer or out of range")))
+				conn.conn.Write([]byte(protocol.EncodeError("ERR value is not an integer or out of range")))
 				return
 			}
 
@@ -260,20 +272,24 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 
 		state.mutex.Unlock()
 
-		conn.Write([]byte(protocol.EncodeInteger(x)))
+		conn.conn.Write([]byte(protocol.EncodeInteger(x)))
 
 	case "CONFIG":
 		if len(command.arguments) == 2 && strings.ToUpper(command.arguments[0]) == "GET" {
 			value, exists := state.config[command.arguments[1]]
 
 			if exists {
-				conn.Write([]byte(protocol.EncodeArray([]string{command.arguments[1], value})))
+				conn.conn.Write([]byte(protocol.EncodeArray([]string{command.arguments[1], value})))
 			} else {
-				conn.Write([]byte(protocol.EncodeNullBulkString()))
+				conn.conn.Write([]byte(protocol.EncodeNullBulkString()))
 			}
 		} else {
 			respondToBadCommand(conn, command)
 		}
+
+	case "MULTI":
+		conn.isBuffering = true
+		conn.conn.Write([]byte(protocol.EncodeString("OK")))
 
 	default:
 		respondToBadCommand(conn, command)
@@ -284,16 +300,21 @@ func handleConnection(conn net.Conn, state *ServerState) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	addr := conn.RemoteAddr().String()
+	connState := ConnState{
+		conn:        conn,
+		isBuffering: false,
+		buffer:      []*Command{},
+		addr:        conn.RemoteAddr().String(),
+	}
 
 	for {
 		// Peek the first character to determine the datatype being sent
 		command, err := receiveCommand(reader)
 
-		if checkReadError(err, addr) {
+		if checkReadError(err, connState.addr) {
 			return
 		}
 
-		processCommand(conn, command, state)
+		processCommand(&connState, command, state)
 	}
 }
