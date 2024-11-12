@@ -220,6 +220,30 @@ func processCommand(conn net.Conn, command *Command, state *ServerState) {
 
 		conn.Write([]byte(protocol.EncodeArray(keys)))
 
+	case "INCR":
+		if len(command.arguments) < 1 {
+			respondToBadCommand(conn, command)
+			return
+		}
+
+		var x = 0
+
+		state.mutex.Lock()
+
+		current, exists := state.values[command.arguments[0]]
+
+		if exists && current.Expiry == nil || current.Expiry.After(time.Now()) {
+			x, _ = strconv.Atoi(current.Value) // TODO: Error Handling
+
+			x += 1
+
+			current.Value = strconv.Itoa(x)
+		}
+
+		state.mutex.Unlock()
+
+		conn.Write([]byte(protocol.EncodeInteger(x)))
+
 	case "CONFIG":
 		if len(command.arguments) == 2 && strings.ToUpper(command.arguments[0]) == "GET" {
 			value, exists := state.config[command.arguments[1]]
