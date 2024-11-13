@@ -3,17 +3,21 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/codecrafters-io/redis-starter-go/internal/protocol"
@@ -22,89 +26,174 @@ import (
 
 type ValueWatchChannel chan *rdb.ValueEntry
 
-type ServerState struct {
-	mutex       sync.RWMutex
-	values      map[string]*rdb.ValueEntry
-	config      map[string]string
-	watchers    map[int]*ValueWatchChannel
-	replication *ReplicationState
+const (
+	defaultDir        = "/tmp"
+	defaultDBFilename = "dump.rdb"
+	defaultPort       = "6379"
+	defaultReplicaOf  = ""
+)
+
+type Config struct {
+	Dir        string
+	DBFilename string
+	Port       string
+	ReplicaOf  string
+}
+
+func (c Config) Get(key string) (string, bool) {
+	switch key {
+	case "dir":
+		return c.Dir, true
+	case "dbfilename":
+		return c.DBFilename, true
+	case "port":
+		return c.Port, true
+	default:
+		return "", false
+	}
 }
 
 type ReplicationState struct {
-	role               string
-	master_replid      string
-	master_repl_offset int
+	role             string
+	masterReplid     string
+	masterReplOffset int
 }
 
-func main() {
-	dir := "/tmp"
-	dbfilename := "dump.rdb"
-	port := "6379"
-	replicaof := ""
+type ServerState struct {
+	// Mutex guarding concurrent access to ServerState
+	// Should be held for all access to mutable parts of the ServerState
+	mutex sync.RWMutex
 
-	for i, arg := range os.Args {
-		if arg == "--dir" && i+1 < len(os.Args) {
-			dir = os.Args[i+1]
-		} else if arg == "--dbfilename" && i+1 < len(os.Args) {
-			dbfilename = os.Args[i+1]
-		} else if arg == "--port" && i+1 < len(os.Args) {
-			port = os.Args[i+1]
-		} else if arg == "--replicaof" && i+1 < len(os.Args) {
-			replicaof = os.Args[i+1]
+	// The main Values map, holding all keyed values
+	values map[string]*rdb.ValueEntry
+
+	config      Config
+	watchers    map[int]ValueWatchChannel
+	replication ReplicationState
+
+	// Open connections from replicas
+	replicas map[int]*ConnState
+}
+
+func validateConfig(cfg *Config) error {
+	// Validate directory exists and is writable
+	if info, err := os.Stat(cfg.Dir); err != nil {
+		return fmt.Errorf("invalid dir: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("dir %s is not a directory", cfg.Dir)
+	}
+
+	// Validate port number
+	if port, err := strconv.Atoi(cfg.Port); err != nil {
+		return fmt.Errorf("invalid port number: %w", err)
+	} else if port < 1 || port > 65535 {
+		return fmt.Errorf("port number %d out of range (1-65535)", port)
+	}
+
+	// Validate dbfilename
+	if cfg.DBFilename == "" {
+		return fmt.Errorf("dbfilename cannot be empty")
+	}
+
+	// Validate replicaof format if specified
+	if cfg.ReplicaOf != "" {
+		parts := strings.Split(cfg.ReplicaOf, " ")
+		if len(parts) != 2 {
+			return fmt.Errorf("replicaof must be in format 'host port'")
+		}
+		if port, err := strconv.Atoi(parts[1]); err != nil {
+			return fmt.Errorf("invalid replica port number: %w", err)
+		} else if port < 1 || port > 65535 {
+			return fmt.Errorf("replica port number %d out of range (1-65535)", port)
 		}
 	}
 
-	config := map[string]string{
-		"dir":        dir,
-		"dbfilename": dbfilename,
-		"port":       port,
+	return nil
+}
+
+func main() {
+	log.Println("Starting up Redis-Go Server")
+
+	// Receive, parse and validate the configuration
+	dir := flag.String("dir", defaultDir, "Directory for database files")
+	dbfilename := flag.String("dbfilename", defaultDBFilename, "Database filename")
+	port := flag.String("port", defaultPort, "Port to listen on")
+	replicaof := flag.String("replicaof", defaultReplicaOf, "Replica of")
+
+	flag.Parse()
+
+	config := Config{
+		Dir:        *dir,
+		DBFilename: *dbfilename,
+		Port:       *port,
+		ReplicaOf:  *replicaof,
 	}
 
-	role := "master"
-	if replicaof != "" {
-		role = "slave"
+	if err := validateConfig(&config); err != nil {
+		log.Fatalf("Configuration error: %v", err)
 	}
 
+	// Setup graceful shutdown
+
+	mainCtx, mainCancel := context.WithCancel(context.Background())
+	defer mainCancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Initiating server shutdown")
+		mainCancel()
+	}()
+
+	// Default replication state
+	// TODO: Randomise the master id (but fixed for purposes of codecrafters)
 	replicationState := ReplicationState{
-		role:               role,
-		master_replid:      "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-		master_repl_offset: 0,
+		role:             "master",
+		masterReplid:     "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+		masterReplOffset: 0,
 	}
 
+	// Default server state, with an empty database.
 	state := ServerState{
 		mutex:       sync.RWMutex{},
 		values:      map[string]*rdb.ValueEntry{},
 		config:      config,
-		watchers:    map[int]*ValueWatchChannel{},
-		replication: &replicationState,
+		watchers:    map[int]ValueWatchChannel{},
+		replication: replicationState,
+		replicas:    map[int]*ConnState{},
 	}
 
-	db, err := rdb.LoadDatabase(path.Join(dir, dbfilename))
-
-	// If database loaded without error, use its state.
+	// Try and load the database from disk, otherwise keep the empty database.
+	db, err := rdb.LoadDatabase(path.Join(*dir, *dbfilename))
 	if err == nil {
 		state.values = db.Hashtable
 	}
 
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here.")
+	// If replicaof is set, we're a slave, and need to spin up a replicator goroutine to
+	// connect to the master and synchronise state.
+	//
+	// Currently this blocks the server from listening until synchronised.
+	if *replicaof != "" {
+		replicationState.role = "slave"
+		replicationState.masterReplid = "?"
 
-	// Bind to port
-	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", port))
-	if err != nil {
-		log.Printf("Failed to bind to port %s\n", port)
-		os.Exit(1)
-	}
-
-	connCounter := 1
-
-	if replicaof != "" {
 		var wg sync.WaitGroup
 		wg.Add(1)
-		go replicator(replicaof, &state, &wg)
+		go replicator(mainCtx, *replicaof, &state, &wg)
 		wg.Wait()
 	}
 
+	// Bind to port
+	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", *port))
+	if err != nil {
+		log.Fatalf("Failed to bind to port %s: %v", *port, err)
+	}
+	defer l.Close()
+
+	// Accept connections in a loop, spawning goroutines for each.
+	// Each connection is assigned a unique integer ID (starting at 1)
+	connCounter := 1
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -112,13 +201,14 @@ func main() {
 			os.Exit(1)
 		}
 
-		go handleConnection(conn, connCounter, &state)
+		connectionId := connCounter
+		go handleConnection(mainCtx, conn, connectionId, &state)
 
 		connCounter += 1
 	}
 }
 
-func replicator(replicaof string, state *ServerState, wg *sync.WaitGroup) {
+func replicator(mainCtx context.Context, replicaof string, state *ServerState, wg *sync.WaitGroup) {
 	parts := strings.Split(replicaof, " ")
 
 	if len(parts) != 2 {
@@ -147,7 +237,7 @@ func replicator(replicaof string, state *ServerState, wg *sync.WaitGroup) {
 	// REPLCONF
 
 	conn.Write([]byte(protocol.EncodeArray([]string{
-		"REPLCONF", "listening-port", state.config["port"],
+		"REPLCONF", "listening-port", state.config.Port,
 	})))
 	resp, _ = protocol.ReadString(reader)
 	if resp != "OK" {
@@ -184,6 +274,18 @@ func replicator(replicaof string, state *ServerState, wg *sync.WaitGroup) {
 	wg.Done()
 
 	for {
+		select {
+		case <-mainCtx.Done():
+			return
+		default:
+			line, _, err := reader.ReadLine()
+
+			if err != nil {
+				log.Fatalf("[replicator] Got error reading from master %#v", err)
+			} else {
+				log.Print(string(line))
+			}
+		}
 	}
 }
 
@@ -252,6 +354,7 @@ type ConnState struct {
 	isBuffering bool
 	buffer      []*Command
 	addr        string
+	isReplica   bool
 }
 
 func encodeEntry(entry *rdb.StreamEntry) string {
@@ -408,7 +511,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 
 	case "CONFIG":
 		if len(command.arguments) == 2 && strings.ToUpper(command.arguments[0]) == "GET" {
-			value, exists := state.config[command.arguments[1]]
+			value, exists := state.config.Get(command.arguments[1])
 
 			if exists {
 				result := protocol.EncodeArray([]string{command.arguments[1], value})
@@ -492,7 +595,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		// Find watches for this stream and notify for change (sending the
 		// stream name so watchers can easily identify the channel).
 		for i := range state.watchers {
-			*state.watchers[i] <- value
+			state.watchers[i] <- value
 		}
 
 		state.mutex.Unlock()
@@ -664,7 +767,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		if len(streamsResults) == 0 && blocking != -1 {
 			c := make(ValueWatchChannel)
 			watchChannel = &c
-			state.watchers[conn.id] = watchChannel
+			state.watchers[conn.id] = c
 		}
 
 		state.mutex.RUnlock()
@@ -761,8 +864,8 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 		info := strings.Join(
 			[]string{
 				fmt.Sprintf("role:%s", state.replication.role),
-				fmt.Sprintf("master_replid:%s", state.replication.master_replid),
-				fmt.Sprintf("master_repl_offset:%d", state.replication.master_repl_offset),
+				fmt.Sprintf("master_replid:%s", state.replication.masterReplid),
+				fmt.Sprintf("master_repl_offset:%d", state.replication.masterReplOffset),
 			}, "\r\n",
 		)
 
@@ -775,7 +878,7 @@ func processCommand(conn *ConnState, command *Command, state *ServerState) *stri
 	}
 }
 
-func handleConnection(conn net.Conn, connId int, state *ServerState) {
+func handleConnection(mainCtx context.Context, conn net.Conn, connId int, state *ServerState) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
@@ -785,75 +888,85 @@ func handleConnection(conn net.Conn, connId int, state *ServerState) {
 		isBuffering: false,
 		buffer:      []*Command{},
 		addr:        conn.RemoteAddr().String(),
+		isReplica:   false,
 	}
 
 	for {
-		// Peek the first character to determine the datatype being sent
-		command, err := receiveCommand(reader)
-
-		if checkReadError(err, connState.addr) {
+		select {
+		case <-mainCtx.Done():
 			return
-		}
+		default:
+			command, err := receiveCommand(reader)
 
-		// Meta commands for Replication
-		if command.name == "REPLCONF" {
-			// TODO: Actual implementation
-			conn.Write([]byte(protocol.EncodeString("OK")))
-		} else if command.name == "PSYNC" {
-			if len(command.arguments) < 2 || command.arguments[0] != "?" || command.arguments[1] != "-1" {
-				log.Printf("Got unexpected PSYNC arguments: %#v", command.arguments)
-				conn.Write([]byte(protocol.EncodeError("Unexpected PSYNC arguments")))
+			if checkReadError(err, connState.addr) {
+				return
+			}
+
+			// Meta commands for Replication
+			if command.name == "REPLCONF" {
+				// TODO: Actual implementation
+				conn.Write([]byte(protocol.EncodeString("OK")))
+			} else if command.name == "PSYNC" {
+				if len(command.arguments) < 2 || command.arguments[0] != "?" || command.arguments[1] != "-1" {
+					log.Printf("Got unexpected PSYNC arguments: %#v", command.arguments)
+					conn.Write([]byte(protocol.EncodeError("Unexpected PSYNC arguments")))
+				} else {
+					conn.Write([]byte(protocol.EncodeString(
+						fmt.Sprintf("FULLRESYNC %s %d", state.replication.masterReplid, 0),
+					)))
+
+					dbbytes, _ := hex.DecodeString(rdb.EmptyHexDatabase)
+
+					conn.Write([]byte(protocol.EncodeBytes(dbbytes)))
+
+					// Mark this connection as a replica link, and add it into the global table of replicas.
+					connState.isReplica = true
+					state.mutex.Lock()
+					state.replicas[connState.id] = &connState
+					state.mutex.Unlock()
+				}
+
+				// Meta commands dealing with Transactions
+			} else if command.name == "MULTI" {
+				connState.isBuffering = true
+				conn.Write([]byte(protocol.EncodeString("OK")))
+			} else if command.name == "DISCARD" {
+				if !connState.isBuffering {
+					conn.Write([]byte(protocol.EncodeError("ERR DISCARD without MULTI")))
+					return
+				}
+
+				connState.buffer = []*Command{}
+				connState.isBuffering = false
+				conn.Write([]byte(protocol.EncodeString("OK")))
+			} else if command.name == "EXEC" {
+				if !connState.isBuffering {
+					conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
+					return
+				}
+
+				// Iterate through the buffer and store the results of each command in sequence
+				var results = []string{}
+				for i := range connState.buffer {
+					results = append(results, *processCommand(&connState, connState.buffer[i], state))
+				}
+
+				// As the return values of processCommand are themselves already encoded, just encode
+				// the outer Array wrapper to return the values.
+				conn.Write([]byte(protocol.EncodeEncodedArray(results)))
+
+				connState.buffer = []*Command{}
+				connState.isBuffering = false
+			} else if connState.isBuffering {
+				// Queue commands while buffering
+				connState.buffer = append(connState.buffer, command)
+				conn.Write([]byte(protocol.EncodeString("QUEUED")))
 			} else {
-				conn.Write([]byte(protocol.EncodeString(
-					fmt.Sprintf("FULLRESYNC %s %d", state.replication.master_replid, 0),
-				)))
-
-				dbbytes, _ := hex.DecodeString(rdb.EmptyHexDatabase)
-
-				conn.Write([]byte(protocol.EncodeBytes(dbbytes)))
-			}
-
-			// Meta commands dealing with Transactions
-		} else if command.name == "MULTI" {
-
-			connState.isBuffering = true
-			conn.Write([]byte(protocol.EncodeString("OK")))
-		} else if command.name == "DISCARD" {
-			if !connState.isBuffering {
-				conn.Write([]byte(protocol.EncodeError("ERR DISCARD without MULTI")))
-				return
-			}
-
-			connState.buffer = []*Command{}
-			connState.isBuffering = false
-			conn.Write([]byte(protocol.EncodeString("OK")))
-		} else if command.name == "EXEC" {
-			if !connState.isBuffering {
-				conn.Write([]byte(protocol.EncodeError("ERR EXEC without MULTI")))
-				return
-			}
-
-			// Iterate through the buffer and store the results of each command in sequence
-			var results = []string{}
-			for i := range connState.buffer {
-				results = append(results, *processCommand(&connState, connState.buffer[i], state))
-			}
-
-			// As the return values of processCommand are themselves already encoded, just encode
-			// the outer Array wrapper to return the values.
-			conn.Write([]byte(protocol.EncodeEncodedArray(results)))
-
-			connState.buffer = []*Command{}
-			connState.isBuffering = false
-		} else if connState.isBuffering {
-			// Queue commands while buffering
-			connState.buffer = append(connState.buffer, command)
-			conn.Write([]byte(protocol.EncodeString("QUEUED")))
-		} else {
-			// Otherwise just execute as we receive.
-			result := processCommand(&connState, command, state)
-			if result != nil {
-				conn.Write([]byte(*result))
+				// Otherwise just execute as we receive.
+				result := processCommand(&connState, command, state)
+				if result != nil {
+					conn.Write([]byte(*result))
+				}
 			}
 		}
 	}
