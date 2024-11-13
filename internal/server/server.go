@@ -292,17 +292,23 @@ func (s *Server) startReplicator() {
 			} else if err != nil {
 				log.Fatalf("[replicator] Got error reading from master %#v", err)
 			} else {
-				handler, err := cmd.Handler()
+				if cmd.Name == "REPLCONF" {
+					if len(cmd.Arguments) == 2 && strings.ToUpper(cmd.Arguments[0]) == "GETACK" && cmd.Arguments[1] == "*" {
+						conn.Write([]byte(protocol.EncodeArray([]string{"REPLCONF", "ACK", "0"})))
+					}
+				} else {
+					handler, err := cmd.Handler()
 
-				if err != nil {
-					log.Printf("[repliactor] Got error getting handler for command `%#v` from master", err)
-					result := protocol.EncodeError(err.Error())
-					conn.Write([]byte(result))
-				}
+					if err != nil {
+						log.Printf("[repliactor] Got error getting handler for command `%#v` from master", err)
+						result := protocol.EncodeError(err.Error())
+						conn.Write([]byte(result))
+					}
 
-				s.commandCh <- CommandRequest{
-					handler:    handler,
-					connection: nil,
+					s.commandCh <- CommandRequest{
+						handler:    handler,
+						connection: nil,
+					}
 				}
 			}
 		}
