@@ -191,7 +191,7 @@ func (s *Server) startExecutor() {
 		// Execute commands from clients
 		case req := <-s.commandCh:
 			// Forward the command to all replicas if it's a write command
-			if req.handler.Mutability()&commands.CmdWrite != 0 && len(s.replicas) > 0 {
+			if s.replication.role == "master" && len(s.replicas) > 0 && req.handler.Mutability()&commands.CmdWrite != 0 {
 				cmd := req.handler.Command()
 				cmdBytes := []byte(protocol.EncodeArray(append([]string{cmd.Name}, cmd.Arguments...)))
 
@@ -201,7 +201,10 @@ func (s *Server) startExecutor() {
 			}
 
 			err := req.handler.Execute(s, func(result string) {
-				req.connection.conn.Write([]byte(result))
+				// Connection can be nil for commands sent via replication
+				if req.connection != nil {
+					req.connection.conn.Write([]byte(result))
+				}
 			})
 
 			if err != nil {
@@ -281,7 +284,7 @@ func (s *Server) startReplicator() {
 		case <-s.ctx.Done():
 			return
 		default:
-			line, _, err := reader.ReadLine()
+			cmd, err := receiveCommand(reader)
 
 			if err == io.EOF {
 				log.Print("[replicator] Master disconnected, terminating replicator.")
@@ -289,7 +292,18 @@ func (s *Server) startReplicator() {
 			} else if err != nil {
 				log.Fatalf("[replicator] Got error reading from master %#v", err)
 			} else {
-				log.Print(string(line))
+				handler, err := cmd.Handler()
+
+				if err != nil {
+					log.Printf("[repliactor] Got error getting handler for command `%#v` from master", err)
+					result := protocol.EncodeError(err.Error())
+					conn.Write([]byte(result))
+				}
+
+				s.commandCh <- CommandRequest{
+					handler:    handler,
+					connection: nil,
+				}
 			}
 		}
 	}
