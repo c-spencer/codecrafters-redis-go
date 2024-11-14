@@ -2,6 +2,7 @@ package commands
 
 import (
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,6 +11,19 @@ import (
 	"github.com/codecrafters-io/redis-starter-go/internal/protocol"
 	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
 )
+
+// Stream-specific support functions
+
+// Comparison function to allow binary-searching for an entry in a stream.
+func findEntryId(entry *rdb.StreamEntry, target *rdb.EntryId) int {
+	if entry.Id.MilliTime < target.MilliTime || (entry.Id.MilliTime == target.MilliTime && entry.Id.SequenceNumber < target.SequenceNumber) {
+		return -1
+	} else if entry.Id.MilliTime == target.MilliTime && entry.Id.SequenceNumber == target.SequenceNumber {
+		return 0
+	} else {
+		return 1
+	}
+}
 
 func encodeEntry(entry *rdb.StreamEntry) string {
 	props := []string{}
@@ -195,13 +209,17 @@ func (h *XReadHandler) Execute(state domain.State, reply func(string)) error {
 		// encoded into an Array string
 		streamResults := []string{}
 
-		// TODO: Binary search for the starting point.
-		for _, entry := range stream.Entries {
-			if entry.Id.MilliTime < start.MilliTime || (entry.Id.MilliTime == start.MilliTime && entry.Id.SequenceNumber <= start.SequenceNumber) {
-				continue
+		// Binary search for the starting point.
+		i := 0
+		if start != nil {
+			i, exists = slices.BinarySearchFunc(stream.Entries, start, findEntryId)
+			// If the exact entry is found, we don't want to include it in the results.
+			if exists {
+				i++
 			}
-
-			streamResults = append(streamResults, encodeEntry(entry))
+		}
+		for ; i < len(stream.Entries); i++ {
+			streamResults = append(streamResults, encodeEntry(stream.Entries[i]))
 		}
 
 		if len(streamResults) > 0 {
@@ -324,12 +342,15 @@ func (h *XRangeHandler) Execute(state domain.State, reply func(string)) error {
 
 	resp := []string{}
 
-	// TODO: Binary search for the starting point.
-	for _, entry := range stream.Entries {
-		if start != nil && (entry.Id.MilliTime < start.MilliTime ||
-			(entry.Id.MilliTime == start.MilliTime && entry.Id.SequenceNumber < start.SequenceNumber)) {
-			continue
-		}
+	// Binary search for the starting point.
+	i := 0
+	if start != nil {
+		i, _ = slices.BinarySearchFunc(stream.Entries, start, findEntryId)
+	}
+
+	for ; i < len(stream.Entries); i++ {
+		entry := stream.Entries[i]
+
 		if end != nil && (entry.Id.MilliTime > end.MilliTime ||
 			(entry.Id.MilliTime == end.MilliTime && entry.Id.SequenceNumber > end.SequenceNumber)) {
 			break

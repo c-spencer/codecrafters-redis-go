@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,7 +22,10 @@ import (
 	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
 )
 
-type Server struct {
+// The main ExecutorState state, holding all data and connections.
+// This should only be accessed via the domain.State interface, and modified
+// by the executor goroutine.
+type ExecutorState struct {
 	// The main Values map, holding all keyed values
 	values map[string]*rdb.ValueEntry
 
@@ -44,17 +47,21 @@ type Server struct {
 	needsReplicaPoll bool
 }
 
+// A generic wrapper for special messages sent from the replication goroutine or follower goroutines
+// to the main executor, via replicaCh.
 type ReplicationMessage struct {
 	messageType string
 	payload     interface{}
 }
 
+// Callbacks that are waiting for changes to any one of a set of keys.
 type Subscription struct {
 	keys      []string
 	expiresAt time.Time
 	callback  func(*rdb.ValueEntry)
 }
 
+// Callbacks that are waiting for a certain number of replicas to reach a certain offset.
 type Waiting struct {
 	offset      int
 	numReplicas int
@@ -62,9 +69,22 @@ type Waiting struct {
 	callback    func(int)
 }
 
+// A CommandRequest is a request to execute a command from a connection on the executor.
+// Sent to the executor via the commandCh channel.
+type CommandRequest struct {
+	// The handler to execute
+	handler commands.Handler
+
+	// The connection from which the command originated
+	conn *Connection
+
+	// The number of bytes the command took to read
+	commandBytes int
+}
+
 // Implement domain.State interface
 
-func (s *Server) Get(key string) (*rdb.ValueEntry, bool) {
+func (s *ExecutorState) Get(key string) (*rdb.ValueEntry, bool) {
 	value, exists := s.values[key]
 
 	// If the key exists but has expired, delete it and treat it as non-existent
@@ -75,7 +95,7 @@ func (s *Server) Get(key string) (*rdb.ValueEntry, bool) {
 
 	return value, exists
 }
-func (s *Server) Set(value *rdb.ValueEntry) {
+func (s *ExecutorState) Set(value *rdb.ValueEntry) {
 	s.values[value.Key] = value
 
 	// Check if any subscriptions are interested in this key
@@ -97,13 +117,13 @@ func (s *Server) Set(value *rdb.ValueEntry) {
 		}
 	}
 }
-func (s *Server) Delete(key string) {
+func (s *ExecutorState) Delete(key string) {
 	delete(s.values, key)
 }
-func (s *Server) Config() domain.ROMap {
+func (s *ExecutorState) Config() domain.ROMap {
 	return &s.config
 }
-func (s *Server) Keys(pattern string) []string {
+func (s *ExecutorState) Keys(pattern string) []string {
 	keys := []string{}
 	for key := range s.values {
 		if matched, _ := path.Match(pattern, key); matched {
@@ -112,7 +132,7 @@ func (s *Server) Keys(pattern string) []string {
 	}
 	return keys
 }
-func (s *Server) Subscribe(keys []string, timeout int, callback func(*rdb.ValueEntry)) {
+func (s *ExecutorState) Subscribe(keys []string, timeout int, callback func(*rdb.ValueEntry)) {
 	// Zero time is a special case, meaning "never expire"
 	expiresAt := time.Time{}
 	if timeout > 0 {
@@ -125,10 +145,10 @@ func (s *Server) Subscribe(keys []string, timeout int, callback func(*rdb.ValueE
 		callback:  callback,
 	})
 }
-func (s *Server) ReplicationInfo() domain.ROMap {
+func (s *ExecutorState) ReplicationInfo() domain.ROMap {
 	return &s.replication
 }
-func (s *Server) ReplicasAtOffset(offset int) int {
+func (s *ExecutorState) ReplicasAtOffset(offset int) int {
 	count := 0
 	for _, replica := range s.replicas {
 		if replica.replOffset.Load() >= int64(offset) {
@@ -137,7 +157,7 @@ func (s *Server) ReplicasAtOffset(offset int) int {
 	}
 	return count
 }
-func (s *Server) WaitForReplicas(offset, numReplicas int, timeout time.Duration, callback func(int)) {
+func (s *ExecutorState) WaitForReplicas(offset, numReplicas int, timeout time.Duration, callback func(int)) {
 	s.waiting = append(s.waiting, Waiting{
 		offset:      offset,
 		numReplicas: numReplicas,
@@ -147,7 +167,7 @@ func (s *Server) WaitForReplicas(offset, numReplicas int, timeout time.Duration,
 
 	s.needsReplicaPoll = true
 }
-func (s *Server) ConnectionOffset() int {
+func (s *ExecutorState) ConnectionOffset() int {
 	if s.currentConnection != nil {
 		return int(s.currentConnection.replOffset.Load())
 	} else {
@@ -155,7 +175,7 @@ func (s *Server) ConnectionOffset() int {
 		return 0
 	}
 }
-func (s *Server) SetConnectionOffset(offset int) {
+func (s *ExecutorState) SetConnectionOffset(offset int) {
 	if s.currentConnection != nil {
 		s.currentConnection.replOffset.Store(int64(offset))
 	} else {
@@ -166,7 +186,7 @@ func (s *Server) SetConnectionOffset(offset int) {
 // Check if any waiting commands can be completed.
 // Should be called whenever the connection offsets are updated, and periodically
 // to check for expired WAIT commands.
-func (s *Server) scanWaiters() {
+func (s *ExecutorState) scanWaiters() {
 	// Iterate backwards to allow for removal of elements
 	for i := len(s.waiting) - 1; i >= 0; i-- {
 		wait := s.waiting[i]
@@ -182,8 +202,10 @@ func (s *Server) scanWaiters() {
 	}
 }
 
-// Create a new server instance from the given context and Config
-func NewServer(context context.Context, config Config) (*Server, error) {
+// Main entrypoint, starts a new server instance from the given context and Config, consisting of
+// a set of goroutines. Will terminate when the context is cancelled, and returns a WaitGroup that
+// can be used to wait for the server to shut down.
+func RunServer(context context.Context, config Config) (*sync.WaitGroup, error) {
 	replicationState := ReplicationState{
 		role:             "master",
 		masterReplid:     "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
@@ -195,7 +217,7 @@ func NewServer(context context.Context, config Config) (*Server, error) {
 		replicationState.masterReplid = "?"
 	}
 
-	server := Server{
+	server := ExecutorState{
 		values:        make(map[string]*rdb.ValueEntry),
 		config:        config,
 		replication:   replicationState,
@@ -207,32 +229,34 @@ func NewServer(context context.Context, config Config) (*Server, error) {
 	}
 
 	db, err := rdb.LoadDatabase(path.Join(config.Dir, config.DBFilename))
+	// If no error, load the database.
+	// For now, silently ignore errors and start with an empty database.
 	if err == nil {
 		server.values = db.Hashtable
 	}
 
-	return &server, nil
-}
+	wg := &sync.WaitGroup{}
 
-// A CommandRequest is a request to execute a command from a client.
-//
-// This is the struct used to communicate between the connection and replication goroutines
-// and the executor goroutine.
-type CommandRequest struct {
-	// The handler to execute
-	handler commands.Handler
+	wg.Add(1)
+	go server.runExecutor(wg)
 
-	// The connection from which the command originated
-	conn *Connection
+	if server.replication.role == "slave" {
+		wg.Add(1)
+		go server.runReplication(wg)
+	}
 
-	// The number of bytes the command took to read
-	commandBytes int
+	wg.Add(1)
+	go server.runAcceptLoop(wg)
+
+	return wg, nil
 }
 
 // Start the main executor goroutine, which will handle all command execution
 // and book-keeping tasks. This function will block until the server is shut down,
 // so it should be run in a separate goroutine.
-func (s *Server) startExecutor() {
+func (s *ExecutorState) runExecutor(wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	// Run book-keeping tasks every 100ms
 	bookkeepingTicker := time.NewTicker(100 * time.Millisecond)
 
@@ -294,7 +318,7 @@ func (s *Server) startExecutor() {
 		case req := <-s.commandCh:
 			// Forward the command to all replicas if it's a write command
 
-			isReplicatedCommand := req.handler.Mutability()&commands.CmdWrite != 0
+			isReplicatedCommand := req.handler.Mutability().IsWrite()
 
 			if isReplicatedCommand && s.replication.role == "master" && len(s.replicas) > 0 {
 				cmd := req.handler.Command()
@@ -351,129 +375,15 @@ func (s *Server) startExecutor() {
 	}
 }
 
-// Start the replication goroutine, which will handle all replication tasks.
-// This connects to the master and listens for commands, forwarding them to the executor.
-func (s *Server) runReplication() {
-	parts := strings.Split(s.config.ReplicaOf, " ")
-
-	if len(parts) != 2 {
-		log.Fatalf("[replication] replicaof must be of form '<HOST> <PORT>', got '%s'", s.config.ReplicaOf)
-	}
-
-	conn, err := net.Dial("tcp", strings.Join(parts, ":"))
-
-	if err != nil {
-		log.Fatalf("[replication] Got error connecting to master %#v", err)
-	}
-
-	reader := bufio.NewReader(conn)
-
-	// Handshake part 1
-	// PING PONG
-
-	conn.Write([]byte(protocol.EncodeArray([]string{"PING"})))
-	resp, _, _ := protocol.ReadString(reader)
-
-	if resp != "PONG" {
-		log.Fatalf("[replication] Expected PONG in response to PING, got %s", resp)
-	}
-
-	// Handshake part 2
-	// REPLCONF
-
-	conn.Write([]byte(protocol.EncodeArray([]string{
-		"REPLCONF", "listening-port", s.config.Port,
-	})))
-	resp, _, _ = protocol.ReadString(reader)
-	if resp != "OK" {
-		log.Fatalf("[replication] Expected OK in response to REPLCONF, got %s", resp)
-	}
-
-	conn.Write([]byte(protocol.EncodeArray([]string{
-		"REPLCONF", "capa", "psync2",
-	})))
-	resp, _, _ = protocol.ReadString(reader)
-	if resp != "OK" {
-		log.Fatalf("[replication] Expected OK in response to REPLCONF, got %s", resp)
-	}
-
-	// Handshake part 3
-	// PSYNC
-
-	conn.Write([]byte(protocol.EncodeArray([]string{"PSYNC", "?", "-1"})))
-	resp, _, _ = protocol.ReadString(reader)
-
-	log.Printf("[replication] Got PSYNC response: %s", resp)
-
-	dbfile, _ := protocol.ReadBytes(reader)
-
-	log.Printf("Received dbfile of length %d", len(dbfile))
-
-	db, err := rdb.LoadDatabaseFromReader(bytes.NewReader(dbfile))
-	if err == nil {
-		s.replicaCh <- ReplicationMessage{
-			messageType: "db",
-			payload:     db.Hashtable,
-		}
-	}
-
-	connState := Connection{
-		// Special ID for the master connection
-		id:   -1,
-		conn: conn,
-		addr: conn.RemoteAddr().String(),
-
-		replOffset: &atomic.Int64{},
-	}
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-			cmd, bytesRead, err := receiveCommand(conn, reader)
-
-			if err != nil {
-				if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
-					// Timeout is expected, yielding to check for graceful shutdown.
-					continue
-				} else if err == io.EOF {
-					log.Print("[replication] Master disconnected, terminating replication.")
-					return
-				} else {
-					log.Fatalf("[replication] Got error reading from master %#v", err)
-				}
-			}
-
-			handler, err := cmd.Handler()
-
-			if err != nil {
-				log.Printf("[replication] Got error getting handler for command `%#v` from master", err)
-				result := protocol.EncodeError(err.Error())
-				conn.Write([]byte(result))
-			}
-
-			s.commandCh <- CommandRequest{
-				handler:      handler,
-				conn:         &connState,
-				commandBytes: bytesRead,
-			}
-		}
-	}
-}
-
 // Start the server, listening for connections and handling them in separate goroutines.
-func (s *Server) Start() {
+func (s *ExecutorState) runAcceptLoop(wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", s.config.Port))
 	if err != nil {
 		log.Fatalf("Failed to bind to port %s: %v", s.config.Port, err)
 	}
 	defer l.Close()
-
-	go s.startExecutor()
-	if s.replication.role == "slave" {
-		go s.runReplication()
-	}
 
 	// Accept connections in a loop, spawning goroutines for each.
 	// Each connection is assigned a unique integer ID (starting at 1)
@@ -502,38 +412,6 @@ func (s *Server) Start() {
 			connCounter += 1
 		}
 	}
-}
-
-// A Connection represents a connection between client and server.
-type Connection struct {
-	// Id will be a positive integer for normal client to server connections.
-	// For the special case of connection from server to master, id will be -1.
-	id   int
-	conn net.Conn
-	addr string
-
-	// Buffering state for MULTI/EXEC transactions. This is done at the connection level,
-	// in order to isolate and remove the need for the executor goroutine to handle this state.
-	isBuffering bool
-	buffer      []commands.Handler
-	bufferBytes int
-
-	// Replication offset for this connection. This is used to track the latest offset that
-	// the client has issued commands at, in order to know which offset to WAIT for on replicas.
-	//
-	// This field is dual purpose, as when Connection represents a replica link, it is used to
-	// store the latest offset that the replica has ack'd to the master.
-	replOffset *atomic.Int64
-
-	// Whether this connection is a replica link (a connection from a replica to the master)
-	isReplica bool
-}
-
-// Clear the buffer of commands for this connection, resetting the state to non-buffering.
-func (c *Connection) clearBuffer() {
-	c.buffer = []commands.Handler{}
-	c.isBuffering = false
-	c.bufferBytes = 0
 }
 
 // Read a full command from a connection, returning the command and the number of bytes read.
@@ -590,7 +468,7 @@ func receiveCommand(conn net.Conn, reader *bufio.Reader) (*commands.Command, int
 
 // Handle a connection from a client, reading commands from the client and sending them
 // to the executor. Must be run in a separate goroutine.
-func handleConnection(s *Server, conn net.Conn, connId int) {
+func handleConnection(s *ExecutorState, conn net.Conn, connId int) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)

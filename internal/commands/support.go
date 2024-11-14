@@ -26,3 +26,8 @@ func parseIntegerArgument(commandName string, args []string) (int64, error) {
 
 	return i, nil
 }
+
+// Return just the first return value of a two-return function.
+func first[T, U any](val T, _ U) T {
+	return val
+}

@@ -104,14 +104,13 @@ func (h *EchoHandler) Mutability() CommandMutability {
 }
 
 // CONFIG command entrypoint
-type ConfigMode string
 
 func NewConfigHandler(cmd *Command) (Handler, error) {
 	if len(cmd.Arguments) < 1 {
 		return nil, errors.New("ERR wrong number of arguments for 'CONFIG' command")
 	}
 
-	switch ConfigMode(cmd.Arguments[0]) {
+	switch cmd.Arguments[0] {
 	case "GET":
 		return NewConfigGetHandler(cmd)
 	default:
@@ -196,6 +195,7 @@ func (h *TypeHandler) Mutability() CommandMutability {
 
 // INFO [section [section ...]]
 // https://redis.io/commands/info/
+//
 // TODO: Implement more sections, and optional section argument
 
 type InfoHandler struct {
@@ -215,10 +215,6 @@ func NewInfoHandler(cmd *Command) (Handler, error) {
 
 		section: section,
 	}, nil
-}
-
-func first[T, U any](val T, _ U) T {
-	return val
 }
 
 func (h *InfoHandler) Execute(state domain.State, reply func(string)) error {
