@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -234,7 +235,7 @@ func (s *Server) startReplicator() {
 	// PING PONG
 
 	conn.Write([]byte(protocol.EncodeArray([]string{"PING"})))
-	resp, _ := protocol.ReadString(reader)
+	resp, _, _ := protocol.ReadString(reader)
 
 	if resp != "PONG" {
 		log.Fatalf("[replicator] Expected PONG in response to PING, got %s", resp)
@@ -246,7 +247,7 @@ func (s *Server) startReplicator() {
 	conn.Write([]byte(protocol.EncodeArray([]string{
 		"REPLCONF", "listening-port", s.config.Port,
 	})))
-	resp, _ = protocol.ReadString(reader)
+	resp, _, _ = protocol.ReadString(reader)
 	if resp != "OK" {
 		log.Fatalf("[replicator] Expected OK in response to REPLCONF, got %s", resp)
 	}
@@ -254,7 +255,7 @@ func (s *Server) startReplicator() {
 	conn.Write([]byte(protocol.EncodeArray([]string{
 		"REPLCONF", "capa", "psync2",
 	})))
-	resp, _ = protocol.ReadString(reader)
+	resp, _, _ = protocol.ReadString(reader)
 	if resp != "OK" {
 		log.Fatalf("[replicator] Expected OK in response to REPLCONF, got %s", resp)
 	}
@@ -263,7 +264,7 @@ func (s *Server) startReplicator() {
 	// PSYNC
 
 	conn.Write([]byte(protocol.EncodeArray([]string{"PSYNC", "?", "-1"})))
-	resp, _ = protocol.ReadString(reader)
+	resp, _, _ = protocol.ReadString(reader)
 
 	log.Printf("[replicator] Got PSYNC response: %s", resp)
 
@@ -279,12 +280,14 @@ func (s *Server) startReplicator() {
 		}
 	}
 
+	bytesReplicated := 0
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		default:
-			cmd, err := receiveCommand(reader)
+			cmd, bytesRead, err := receiveCommand(reader)
 
 			if err == io.EOF {
 				log.Print("[replicator] Master disconnected, terminating replicator.")
@@ -293,8 +296,13 @@ func (s *Server) startReplicator() {
 				log.Fatalf("[replicator] Got error reading from master %#v", err)
 			} else {
 				if cmd.Name == "REPLCONF" {
-					if len(cmd.Arguments) == 2 && strings.ToUpper(cmd.Arguments[0]) == "GETACK" && cmd.Arguments[1] == "*" {
-						conn.Write([]byte(protocol.EncodeArray([]string{"REPLCONF", "ACK", "0"})))
+					if len(cmd.Arguments) == 2 &&
+						strings.ToUpper(cmd.Arguments[0]) == "GETACK" && cmd.Arguments[1] == "*" {
+						conn.Write([]byte(protocol.EncodeArray([]string{
+							"REPLCONF",
+							"ACK",
+							strconv.Itoa(bytesReplicated),
+						})))
 					}
 				} else {
 					handler, err := cmd.Handler()
@@ -310,6 +318,8 @@ func (s *Server) startReplicator() {
 						connection: nil,
 					}
 				}
+
+				bytesReplicated += bytesRead
 			}
 		}
 	}
@@ -359,30 +369,34 @@ type Connection struct {
 	isReplica   bool
 }
 
-func receiveCommand(reader *bufio.Reader) (*commands.Command, error) {
+func receiveCommand(reader *bufio.Reader) (*commands.Command, int, error) {
 	// Peek the first character to determine the datatype being sent
 	c, err := reader.Peek(1)
 
+	// TODO: Handle bytesRead properly outside of the happy path, here and in protocol.
+
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var rawCommand = []string{}
+	var bytesRead = 0
 
 	switch string(c) {
 	// Read standard Array commands format
 	case "*":
-		rawCommand, err = protocol.ReadArray(reader)
+		rawCommand, bytesRead, err = protocol.ReadArray(reader)
 
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	// Fallback to inline commands format
 	default:
-		rawLine, err := protocol.ReadLine(reader)
+		rawLine, b, err := protocol.ReadLine(reader)
+		bytesRead += b
 
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		rawCommand = strings.Split(rawLine, " ")
@@ -393,7 +407,7 @@ func receiveCommand(reader *bufio.Reader) (*commands.Command, error) {
 		Arguments: rawCommand[1:],
 	}
 
-	return &command, nil
+	return &command, bytesRead, nil
 }
 
 func checkReadError(err error, addr string) bool {
@@ -427,7 +441,7 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 			log.Printf("Closing connection %d", connState.id)
 			return
 		default:
-			command, err := receiveCommand(reader)
+			command, _, err := receiveCommand(reader)
 
 			if checkReadError(err, connState.addr) {
 				return
