@@ -308,7 +308,7 @@ func (s *Server) startReplicator() {
 					handler, err := cmd.Handler()
 
 					if err != nil {
-						log.Printf("[repliactor] Got error getting handler for command `%#v` from master", err)
+						log.Printf("[replicator] Got error getting handler for command `%#v` from master", err)
 						result := protocol.EncodeError(err.Error())
 						conn.Write([]byte(result))
 					}
@@ -506,7 +506,6 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 				connState.isBuffering = false
 			} else {
 				// Otherwise just find handlers as we receive, and either buffer or send to the executor
-
 				log.Printf("[%s] Received command: %#v", connState.addr, command)
 
 				handler, err := command.Handler()
