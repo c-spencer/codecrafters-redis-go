@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
 	"github.com/codecrafters-io/redis-starter-go/internal/server"
@@ -21,7 +23,7 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	// TODO: Figure out why this slows down the codecrafters tests so much
-	// signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
 		log.Println("Initiating server shutdown")

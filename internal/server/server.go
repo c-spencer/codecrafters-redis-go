@@ -431,27 +431,32 @@ func (s *Server) runReplication() {
 		case <-s.ctx.Done():
 			return
 		default:
-			cmd, bytesRead, err := receiveCommand(reader)
+			cmd, bytesRead, err := receiveCommand(conn, reader)
 
-			if err == io.EOF {
-				log.Print("[replication] Master disconnected, terminating replication.")
-				return
-			} else if err != nil {
-				log.Fatalf("[replication] Got error reading from master %#v", err)
-			} else {
-				handler, err := cmd.Handler()
-
-				if err != nil {
-					log.Printf("[replication] Got error getting handler for command `%#v` from master", err)
-					result := protocol.EncodeError(err.Error())
-					conn.Write([]byte(result))
+			if err != nil {
+				if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+					// Timeout is expected, yielding to check for graceful shutdown.
+					continue
+				} else if err == io.EOF {
+					log.Print("[replication] Master disconnected, terminating replication.")
+					return
+				} else {
+					log.Fatalf("[replication] Got error reading from master %#v", err)
 				}
+			}
 
-				s.commandCh <- CommandRequest{
-					handler:      handler,
-					conn:         &connState,
-					commandBytes: bytesRead,
-				}
+			handler, err := cmd.Handler()
+
+			if err != nil {
+				log.Printf("[replication] Got error getting handler for command `%#v` from master", err)
+				result := protocol.EncodeError(err.Error())
+				conn.Write([]byte(result))
+			}
+
+			s.commandCh <- CommandRequest{
+				handler:      handler,
+				conn:         &connState,
+				commandBytes: bytesRead,
 			}
 		}
 	}
@@ -474,6 +479,8 @@ func (s *Server) Start() {
 	// Each connection is assigned a unique integer ID (starting at 1)
 	connCounter := 1
 	for {
+		l.(*net.TCPListener).SetDeadline(time.Now().Add(250 * time.Millisecond))
+
 		select {
 		case <-s.ctx.Done():
 			log.Println("Refusing new connections")
@@ -481,6 +488,10 @@ func (s *Server) Start() {
 		default:
 			conn, err := l.Accept()
 			if err != nil {
+				if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+					// Timeout is expected, yielding to check for graceful shutdown.
+					continue
+				}
 				log.Println("Error accepting connection: ", err.Error())
 				os.Exit(1)
 			}
@@ -525,16 +536,26 @@ func (c *Connection) clearBuffer() {
 	c.bufferBytes = 0
 }
 
-// Read a full command from the reader, returning the command and the number of bytes read.
-func receiveCommand(reader *bufio.Reader) (*commands.Command, int, error) {
+// Read a full command from a connection, returning the command and the number of bytes read.
+// This will yield a timeout error if no initial data is received within 250ms.
+//
+// Slightly awkardly, this takes both the underlying connection and a buffered reader, as it
+// needs to control setting the deadlines, but in some circumstances the reader may already
+// be instantiated and have read part of the connection we're interested in.
+func receiveCommand(conn net.Conn, reader *bufio.Reader) (*commands.Command, int, error) {
+	// Set a read deadline to prevent blocking on a client for too long (to allow for prompt
+	// graceful shutdown)
+	conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+
 	// Peek the first character to determine the datatype being sent
 	c, err := reader.Peek(1)
-
-	// TODO: Handle bytesRead properly outside of the happy path, here and in protocol.
 
 	if err != nil {
 		return nil, 0, err
 	}
+
+	// Remove the read deadline now that we've started to receive a message.
+	conn.SetReadDeadline(time.Time{})
 
 	var rawCommand = []string{}
 	var bytesRead = 0
@@ -593,14 +614,19 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 			log.Printf("Closing connection %d", connState.id)
 			return
 		default:
-			command, commandBytes, err := receiveCommand(reader)
+			command, commandBytes, err := receiveCommand(conn, reader)
 
-			if err == io.EOF {
-				log.Printf("[%s] Disconnected", connState.addr)
-				return
-			} else if err != nil {
-				log.Printf("[%s] Got error reading client command `%#v`", connState.addr, err)
-				continue
+			if err != nil {
+				if opErr, ok := err.(*net.OpError); ok && opErr.Timeout() {
+					// Timeout is expected, yielding to check for graceful shutdown.
+					continue
+				} else if err == io.EOF || strings.Contains(err.Error(), "connection reset by peer") {
+					log.Printf("[%s] Disconnected", connState.addr)
+					return
+				} else {
+					log.Printf("[%s] Got error reading client command `%#v` %s", connState.addr, err, err.Error())
+					continue
+				}
 			}
 
 			// Meta commands for Replication

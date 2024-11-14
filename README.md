@@ -60,3 +60,4 @@ Todo list of things that pass the tests but aren't fully fleshed out.
 - In-repo tests for the main server loop, replication, etc.
 - Implement partial database synchronisation and failover.
 - Implement writing database state to disk.
+- Add proper structured logging
