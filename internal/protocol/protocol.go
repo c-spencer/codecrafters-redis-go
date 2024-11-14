@@ -138,6 +138,23 @@ func ReadString(reader *bufio.Reader) (string, int, error) {
 	return line[1:], bytesRead, nil
 }
 
+// ReadInteger reads an integer from the reader
+func ReadInteger(reader *bufio.Reader) (int, int, error) {
+	line, bytesRead, err := ReadLine(reader)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(line) < 1 || line[0] != ':' {
+		return 0, bytesRead, fmt.Errorf("invalid integer format")
+	}
+	var value int
+	_, err = fmt.Sscanf(line[1:], "%d", &value)
+	if err != nil {
+		return 0, bytesRead, err
+	}
+	return value, bytesRead, nil
+}
+
 // ReadArray reads an array from the reader
 func ReadArray(reader *bufio.Reader) ([]string, int, error) {
 	totalBytesRead := 0

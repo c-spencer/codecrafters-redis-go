@@ -3,6 +3,7 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/codecrafters-io/redis-starter-go/internal/domain"
@@ -18,7 +19,9 @@ type PingHandler struct {
 }
 
 func NewPingHandler(cmd *Command) (Handler, error) {
-	return &PingHandler{}, nil
+	return &PingHandler{
+		BaseHandler: BaseHandler{command: cmd},
+	}, nil
 }
 
 func (h *PingHandler) Execute(state domain.State, reply func(string)) error {
@@ -45,7 +48,7 @@ func NewExecHandler(handlers []Handler) Handler {
 }
 
 func (h *ExecHandler) Command() *Command {
-	// TODO
+	log.Fatalf("ExecHandler.Command() not implemented")
 	return nil
 }
 func (h *ExecHandler) Wait() {}

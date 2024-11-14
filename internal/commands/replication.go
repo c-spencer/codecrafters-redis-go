@@ -2,20 +2,23 @@ package commands
 
 import (
 	"errors"
+	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/codecrafters-io/redis-starter-go/internal/domain"
 	"github.com/codecrafters-io/redis-starter-go/internal/protocol"
 )
 
-// ...existing code...
+// WAIT numreplicas timeout
 
 type WaitHandler struct {
 	BaseHandler
 
 	numReplicas int
 	timeout     time.Duration
+	wg          *sync.WaitGroup
 }
 
 func NewWaitHandler(cmd *Command) (Handler, error) {
@@ -33,18 +36,135 @@ func NewWaitHandler(cmd *Command) (Handler, error) {
 		return nil, errors.New("ERR invalid timeout")
 	}
 
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
 	return &WaitHandler{
+		BaseHandler: BaseHandler{command: cmd},
+
 		numReplicas: numReplicas,
 		timeout:     time.Duration(timeoutMillis) * time.Millisecond,
+		wg:          &wg,
 	}, nil
 }
 
 func (h *WaitHandler) Execute(state domain.State, reply func(string)) error {
-	followerCount, _ := state.ReplicationInfo().GetInt("followerCount")
-	reply(protocol.EncodeInteger(followerCount))
+	connOffset := state.ConnectionOffset()
+
+	// Synchronously check if we already have enough replicas
+	replicaCount := state.ReplicasAtOffset(connOffset)
+	if replicaCount >= h.numReplicas {
+		reply(protocol.EncodeInteger(replicaCount))
+		h.wg.Done()
+		return nil
+	}
+
+	// Otherwise wait for more replicas
+	state.WaitForReplicas(connOffset, h.numReplicas, h.timeout, func(count int) {
+		reply(protocol.EncodeInteger(count))
+		h.wg.Done()
+	})
+
 	return nil
+
+	// connectedSlaves, _ := state.ReplicationInfo().GetInt("connectedSlaves")
+	// reply(protocol.EncodeInteger(connectedSlaves))
+	// return nil
 }
 
 func (h *WaitHandler) Mutability() CommandMutability {
+	return CmdRead
+}
+
+func (h *WaitHandler) Wait() {
+	h.wg.Wait()
+}
+
+// REPLCONF command entrypoint
+
+type ReplConfMode string
+
+func NewReplConfHandler(cmd *Command) (Handler, error) {
+	if len(cmd.Arguments) < 1 {
+		return nil, errors.New("ERR wrong number of arguments for 'REPLCONF' command")
+	}
+
+	switch ReplConfMode(cmd.Arguments[0]) {
+	case "GETACK":
+		return NewReplConfGetAckHandler(cmd)
+	case "ACK":
+		return NewReplConfAckHandler(cmd)
+	default:
+		return nil, errors.New("ERR unknown REPLCONF mode")
+	}
+}
+
+// REPLCONF GETACK offset
+
+type ReplConfGetAckHandler struct {
+	BaseHandler
+
+	offset int
+}
+
+func NewReplConfGetAckHandler(cmd *Command) (Handler, error) {
+	if len(cmd.Arguments) != 2 || cmd.Arguments[0] != "GETACK" {
+		return nil, errors.New("ERR wrong number of arguments for 'REPLCONF GETACK' command")
+	}
+
+	var offset = -1
+	if cmd.Arguments[1] != "*" {
+		return nil, errors.New("ERR specific GETACK offsets NYI")
+	}
+
+	return &ReplConfGetAckHandler{
+		BaseHandler: BaseHandler{command: cmd},
+
+		offset: offset,
+	}, nil
+}
+
+func (h *ReplConfGetAckHandler) Execute(state domain.State, reply func(string)) error {
+	masterReplOffset, _ := state.ReplicationInfo().GetInt("masterReplOffset")
+	reply(protocol.EncodeArray([]string{"REPLCONF", "ACK", strconv.Itoa(masterReplOffset)}))
+	return nil
+}
+
+func (h *ReplConfGetAckHandler) Mutability() CommandMutability {
+	return CmdWrite
+}
+
+// REPLCONF ACK offset
+
+type ReplConfAckHandler struct {
+	BaseHandler
+
+	offset int
+}
+
+func NewReplConfAckHandler(cmd *Command) (Handler, error) {
+	if len(cmd.Arguments) != 2 || cmd.Arguments[0] != "ACK" {
+		return nil, errors.New("ERR wrong number of arguments for 'REPLCONF ACK' command")
+	}
+
+	offset, err := strconv.Atoi(cmd.Arguments[1])
+	if err != nil {
+		return nil, errors.New("ERR invalid offset")
+	}
+
+	return &ReplConfAckHandler{
+		BaseHandler: BaseHandler{command: cmd},
+
+		offset: offset,
+	}, nil
+}
+
+func (h *ReplConfAckHandler) Execute(state domain.State, reply func(string)) error {
+	log.Printf("Received REPLCONF ACK %d", h.offset)
+	state.SetConnectionOffset(h.offset)
+	return nil
+}
+
+func (h *ReplConfAckHandler) Mutability() CommandMutability {
 	return CmdRead
 }

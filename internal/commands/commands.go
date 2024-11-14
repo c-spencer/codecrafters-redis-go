@@ -86,7 +86,8 @@ var handlers = map[string]func(*Command) (Handler, error){
 	"XRANGE": NewXRangeHandler,
 
 	// Replication commands
-	"WAIT": NewWaitHandler,
+	"WAIT":     NewWaitHandler,
+	"REPLCONF": NewReplConfHandler,
 }
 
 func (c *Command) Handler() (Handler, error) {

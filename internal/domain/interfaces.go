@@ -1,6 +1,10 @@
 package domain
 
-import "github.com/codecrafters-io/redis-starter-go/internal/rdb"
+import (
+	"time"
+
+	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
+)
 
 type State interface {
 	// Return the value for the given key, if it exists.
@@ -22,6 +26,10 @@ type State interface {
 	// Return the configuration or state of the server.
 	Config() ROMap
 	ReplicationInfo() ROMap
+	ReplicasAtOffset(offset int) int
+	WaitForReplicas(offset, numReplicas int, timeout time.Duration, callback func(int))
+	ConnectionOffset() int
+	SetConnectionOffset(offset int)
 }
 
 type ROMap interface {

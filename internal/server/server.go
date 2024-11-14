@@ -12,8 +12,8 @@ import (
 	"os"
 	"path"
 	"slices"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/codecrafters-io/redis-starter-go/internal/commands"
@@ -26,9 +26,10 @@ type Server struct {
 	// The main Values map, holding all keyed values
 	values map[string]*rdb.ValueEntry
 
-	config      Config
-	replication ReplicationState
-	replicas    map[int]*Connection
+	config            Config
+	replication       ReplicationState
+	replicas          map[int]*Connection
+	currentConnection *Connection
 
 	ctx context.Context
 
@@ -38,7 +39,9 @@ type Server struct {
 	// Hacky, but it works for now.
 	replicaCh chan ReplicationMessage
 
-	subscriptions []Subscription
+	subscriptions    []Subscription
+	waiting          []Waiting
+	needsReplicaPoll bool
 }
 
 type ReplicationMessage struct {
@@ -50,6 +53,13 @@ type Subscription struct {
 	keys      []string
 	expiresAt time.Time
 	callback  func(*rdb.ValueEntry)
+}
+
+type Waiting struct {
+	offset      int
+	numReplicas int
+	expiry      time.Time
+	callback    func(int)
 }
 
 // Implement domain.State interface
@@ -70,13 +80,15 @@ func (s *Server) Set(value *rdb.ValueEntry) {
 
 	// Check if any subscriptions are interested in this key
 	// Placeholder (but obviously correct) code. This should be optimized.
-	for i := 0; i < len(s.subscriptions); i++ {
+	// Iterate backwards to allow for safe removal of elements
+	for i := len(s.subscriptions) - 1; i >= 0; i-- {
 		sub := s.subscriptions[i]
 
-		// Remove the subscription if it has expired
+		// Check for expiry prior to checking for fulfillment
 		if !sub.expiresAt.IsZero() && sub.expiresAt.Before(time.Now()) {
 			sub.callback(nil)
 			s.subscriptions = append(s.subscriptions[:i], s.subscriptions[i+1:]...)
+			continue
 		}
 
 		if slices.Contains(sub.keys, value.Key) {
@@ -116,7 +128,61 @@ func (s *Server) Subscribe(keys []string, timeout int, callback func(*rdb.ValueE
 func (s *Server) ReplicationInfo() domain.ROMap {
 	return &s.replication
 }
+func (s *Server) ReplicasAtOffset(offset int) int {
+	count := 0
+	for _, replica := range s.replicas {
+		if replica.replOffset.Load() >= int64(offset) {
+			count++
+		}
+	}
+	return count
+}
+func (s *Server) WaitForReplicas(offset, numReplicas int, timeout time.Duration, callback func(int)) {
+	s.waiting = append(s.waiting, Waiting{
+		offset:      offset,
+		numReplicas: numReplicas,
+		expiry:      time.Now().Add(timeout),
+		callback:    callback,
+	})
 
+	s.needsReplicaPoll = true
+}
+func (s *Server) ConnectionOffset() int {
+	if s.currentConnection != nil {
+		return int(s.currentConnection.replOffset.Load())
+	} else {
+		log.Printf("WARN ConnectionOffset called outside of a command context")
+		return 0
+	}
+}
+func (s *Server) SetConnectionOffset(offset int) {
+	if s.currentConnection != nil {
+		s.currentConnection.replOffset.Store(int64(offset))
+	} else {
+		log.Printf("WARN SetConnectionOffset called outside of a command context")
+	}
+}
+
+// Check if any waiting commands can be completed.
+// Should be called whenever the connection offsets are updated, and periodically
+// to check for expired WAIT commands.
+func (s *Server) scanWaiters() {
+	// Iterate backwards to allow for removal of elements
+	for i := len(s.waiting) - 1; i >= 0; i-- {
+		wait := s.waiting[i]
+
+		count := s.ReplicasAtOffset(wait.offset)
+		expired := !wait.expiry.IsZero() && wait.expiry.Before(time.Now())
+		fulfilled := count >= wait.numReplicas
+
+		if expired || fulfilled {
+			wait.callback(count)
+			s.waiting = append(s.waiting[:i], s.waiting[i+1:]...)
+		}
+	}
+}
+
+// Create a new server instance from the given context and Config
 func NewServer(context context.Context, config Config) (*Server, error) {
 	replicationState := ReplicationState{
 		role:             "master",
@@ -148,14 +214,27 @@ func NewServer(context context.Context, config Config) (*Server, error) {
 	return &server, nil
 }
 
+// A CommandRequest is a request to execute a command from a client.
+//
+// This is the struct used to communicate between the connection and replicator goroutines
+// and the executor goroutine.
 type CommandRequest struct {
-	handler    commands.Handler
-	connection *Connection
+	// The handler to execute
+	handler commands.Handler
+
+	// The connection from which the command originated
+	conn *Connection
+
+	// The number of bytes the command took to read
+	commandBytes int
 }
 
+// Start the main executor goroutine, which will handle all command execution
+// and book-keeping tasks. This function will block until the server is shut down,
+// so it should be run in a separate goroutine.
 func (s *Server) startExecutor() {
 	// Run book-keeping tasks every 100ms
-	ticker := time.NewTicker(100 * time.Millisecond)
+	bookkeepingTicker := time.NewTicker(100 * time.Millisecond)
 
 	for {
 		select {
@@ -165,8 +244,8 @@ func (s *Server) startExecutor() {
 			return
 
 		// Regular book-keeping tasks
-		case <-ticker.C:
-			// Check if any subscriptions are expired.
+		case <-bookkeepingTicker.C:
+			// Check if any subscriptions on keys are expired.
 			// Placeholder (but obviously correct) code. This should be optimized.
 			for i := 0; i < len(s.subscriptions); i++ {
 				sub := s.subscriptions[i]
@@ -178,22 +257,46 @@ func (s *Server) startExecutor() {
 				}
 			}
 
-		// Handle replication
+			// Check if an eager poll of replicas is needed
+			// QUESTION: Issue in the main event loop rather than as part of bookkeeping?
+			if s.needsReplicaPoll {
+				// Poll replicas for their replication offsets
+				getAck := []byte(protocol.EncodeArray([]string{"REPLCONF", "GETACK", "*"}))
+				for _, replica := range s.replicas {
+					_, err := replica.conn.Write(getAck)
+					if err != nil {
+						log.Printf("Got error polling replica %d: %#v", replica.id, err)
+					}
+				}
+
+				s.needsReplicaPoll = false
+			}
+
+			// Periodically check if any waiting commands can be resolved (timeout)
+			s.scanWaiters()
+
+		// Handle special messages from the replicator or followers
+		// Note replicated commands are issued directly to the command channel
 		case msg := <-s.replicaCh:
 			// TODO: Review what other state needs to be updated
 			switch msg.messageType {
 			case "db":
+				// Replace the entire database with the new one
 				s.values = msg.payload.(map[string]*rdb.ValueEntry)
-			case "replica":
+			case "newReplica":
+				// Record the new replica connection
 				replica := msg.payload.(Connection)
 				s.replicas[replica.id] = &replica
-				s.replication.followerCount += 1
+				s.replication.connectedSlaves += 1
 			}
 
 		// Execute commands from clients
 		case req := <-s.commandCh:
 			// Forward the command to all replicas if it's a write command
-			if s.replication.role == "master" && len(s.replicas) > 0 && req.handler.Mutability()&commands.CmdWrite != 0 {
+
+			isReplicatedCommand := req.handler.Mutability()&commands.CmdWrite != 0
+
+			if isReplicatedCommand && s.replication.role == "master" && len(s.replicas) > 0 {
 				cmd := req.handler.Command()
 				cmdBytes := []byte(protocol.EncodeArray(append([]string{cmd.Name}, cmd.Arguments...)))
 
@@ -202,21 +305,44 @@ func (s *Server) startExecutor() {
 				}
 			}
 
+			// Assign the connection into the server state for the duration of the command.
+			// Hacky, but allows the command to get/set the correct offset.
+			// Proper solution would be to pass a separate connection metadata
+			// to Handler#Execute().
+			s.currentConnection = req.conn
+
+			// Actually execute the handler on the server state.
 			err := req.handler.Execute(s, func(result string) {
-				// Connection can be nil for commands sent via replication
-				if req.connection != nil {
-					req.connection.conn.Write([]byte(result))
+				// Responses are not sent to the Master for most messages.
+				// Negative IDs are used for the Master connection.
+				if req.conn.id >= 0 || req.handler.Command().Name == "REPLCONF" {
+					req.conn.conn.Write([]byte(result))
 				}
 			})
 
-			if err != nil {
-				log.Printf("[%s] Got error executing command `%#v`", req.connection.addr, err)
-				req.connection.conn.Write([]byte(protocol.EncodeError(err.Error())))
+			// Only increment the processed bytes count for replicated commands.
+			// Also update for all commands issued via replication (id == -1).
+			if isReplicatedCommand || req.conn.id == -1 {
+				s.replication.masterReplOffset += req.commandBytes
 			}
+
+			// Store the new replication offset in the connection metadata
+			// This tracks the latest offset that the client has given us, so we know
+			// which offset to check for on the replicas should the client issue a WAIT.
+			s.currentConnection.replOffset.Store(int64(s.replication.masterReplOffset))
+
+			if err != nil {
+				log.Printf("[%s] Got error executing command `%#v`", req.conn.addr, err)
+				req.conn.conn.Write([]byte(protocol.EncodeError(err.Error())))
+			}
+
+			s.currentConnection = nil
 		}
 	}
 }
 
+// Start the replicator goroutine, which will handle all replication tasks.
+// This connects to the master and listens for commands, forwarding them to the executor.
 func (s *Server) startReplicator() {
 	parts := strings.Split(s.config.ReplicaOf, " ")
 
@@ -281,7 +407,14 @@ func (s *Server) startReplicator() {
 		}
 	}
 
-	bytesReplicated := 0
+	connState := Connection{
+		// Special ID for the master connection
+		id:   -1,
+		conn: conn,
+		addr: conn.RemoteAddr().String(),
+
+		replOffset: &atomic.Int64{},
+	}
 
 	for {
 		select {
@@ -296,36 +429,25 @@ func (s *Server) startReplicator() {
 			} else if err != nil {
 				log.Fatalf("[replicator] Got error reading from master %#v", err)
 			} else {
-				if cmd.Name == "REPLCONF" {
-					if len(cmd.Arguments) == 2 &&
-						strings.ToUpper(cmd.Arguments[0]) == "GETACK" && cmd.Arguments[1] == "*" {
-						conn.Write([]byte(protocol.EncodeArray([]string{
-							"REPLCONF",
-							"ACK",
-							strconv.Itoa(bytesReplicated),
-						})))
-					}
-				} else {
-					handler, err := cmd.Handler()
+				handler, err := cmd.Handler()
 
-					if err != nil {
-						log.Printf("[replicator] Got error getting handler for command `%#v` from master", err)
-						result := protocol.EncodeError(err.Error())
-						conn.Write([]byte(result))
-					}
-
-					s.commandCh <- CommandRequest{
-						handler:    handler,
-						connection: nil,
-					}
+				if err != nil {
+					log.Printf("[replicator] Got error getting handler for command `%#v` from master", err)
+					result := protocol.EncodeError(err.Error())
+					conn.Write([]byte(result))
 				}
 
-				bytesReplicated += bytesRead
+				s.commandCh <- CommandRequest{
+					handler:      handler,
+					conn:         &connState,
+					commandBytes: bytesRead,
+				}
 			}
 		}
 	}
 }
 
+// Start the server, listening for connections and handling them in separate goroutines.
 func (s *Server) Start() {
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", s.config.Port))
 	if err != nil {
@@ -362,12 +484,17 @@ func (s *Server) Start() {
 }
 
 type Connection struct {
-	id          int
-	conn        net.Conn
+	id   int
+	conn net.Conn
+	addr string
+
 	isBuffering bool
 	buffer      []commands.Handler
-	addr        string
-	isReplica   bool
+	bufferBytes int
+
+	replOffset *atomic.Int64
+
+	isReplica bool
 }
 
 func receiveCommand(reader *bufio.Reader) (*commands.Command, int, error) {
@@ -428,12 +555,17 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 
 	reader := bufio.NewReader(conn)
 	connState := Connection{
-		id:          connId,
-		conn:        conn,
+		id:   connId,
+		conn: conn,
+		addr: conn.RemoteAddr().String(),
+
 		isBuffering: false,
 		buffer:      []commands.Handler{},
-		addr:        conn.RemoteAddr().String(),
-		isReplica:   false,
+		bufferBytes: 0,
+
+		replOffset: &atomic.Int64{},
+
+		isReplica: false,
 	}
 
 	for {
@@ -442,15 +574,15 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 			log.Printf("Closing connection %d", connState.id)
 			return
 		default:
-			command, _, err := receiveCommand(reader)
+			command, commandBytes, err := receiveCommand(reader)
 
 			if checkReadError(err, connState.addr) {
 				return
 			}
 
 			// Meta commands for Replication
-			if command.Name == "REPLCONF" {
-				// TODO: Actual implementation
+			if command.Name == "REPLCONF" && (len(command.Arguments) == 0 || command.Arguments[0] == "listening-port" || command.Arguments[0] == "capa") {
+				// TODO: Implement this properly via handlers
 				conn.Write([]byte(protocol.EncodeString("OK")))
 			} else if command.Name == "PSYNC" {
 				if len(command.Arguments) < 2 || command.Arguments[0] != "?" || command.Arguments[1] != "-1" {
@@ -469,7 +601,7 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 					connState.isReplica = true
 
 					s.replicaCh <- ReplicationMessage{
-						messageType: "replica",
+						messageType: "newReplica",
 						payload:     connState,
 					}
 				}
@@ -486,6 +618,7 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 
 				connState.buffer = []commands.Handler{}
 				connState.isBuffering = false
+				connState.bufferBytes = 0
 				conn.Write([]byte(protocol.EncodeString("OK")))
 			} else if command.Name == "EXEC" {
 				if !connState.isBuffering {
@@ -495,8 +628,9 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 
 				// Join all buffered commands into a single ExecHandler, and send it to the executor
 				s.commandCh <- CommandRequest{
-					handler:    commands.NewExecHandler(connState.buffer),
-					connection: &connState,
+					handler:      commands.NewExecHandler(connState.buffer),
+					conn:         &connState,
+					commandBytes: connState.bufferBytes,
 				}
 
 				// Assumption: Don't need to Wait here, as grouped commands do not block.
@@ -505,9 +639,10 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 
 				connState.buffer = []commands.Handler{}
 				connState.isBuffering = false
+				connState.bufferBytes = 0
 			} else {
 				// Otherwise just find handlers as we receive, and either buffer or send to the executor
-				log.Printf("[%s] Received command: %#v", connState.addr, command)
+				log.Printf("[%s] Received command %s", connState.addr, command.Name)
 
 				handler, err := command.Handler()
 
@@ -519,11 +654,13 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 
 				if connState.isBuffering {
 					connState.buffer = append(connState.buffer, handler)
+					connState.bufferBytes += commandBytes
 					conn.Write([]byte(protocol.EncodeString("QUEUED")))
 				} else {
 					s.commandCh <- CommandRequest{
-						handler:    handler,
-						connection: &connState,
+						handler:      handler,
+						conn:         &connState,
+						commandBytes: commandBytes,
 					}
 
 					// Wait for the handler to be done. For all non-blocking commands, this is a no-op.
