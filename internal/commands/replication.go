@@ -40,8 +40,8 @@ func NewWaitHandler(cmd *Command) (Handler, error) {
 }
 
 func (h *WaitHandler) Execute(state domain.State, reply func(string)) error {
-	//replicatedCount := state.WaitForReplication(h.numReplicas, h.timeout)
-	reply(protocol.EncodeInteger(0))
+	followerCount, _ := state.ReplicationInfo().GetInt("followerCount")
+	reply(protocol.EncodeInteger(followerCount))
 	return nil
 }
 

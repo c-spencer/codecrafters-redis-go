@@ -187,6 +187,7 @@ func (s *Server) startExecutor() {
 			case "replica":
 				replica := msg.payload.(Connection)
 				s.replicas[replica.id] = &replica
+				s.replication.followerCount += 1
 			}
 
 		// Execute commands from clients
