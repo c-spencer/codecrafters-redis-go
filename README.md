@@ -15,10 +15,24 @@ event loops, the Redis protocol and more.
 For the given codecrafters course sections.
 
 - [x] Basics
+    - `GET`/`SET` implementations
+    - Key expiry
 - [x] Replication
+    - `--replicaof` CLI argument
+    - Master<>Slave asynchronous replication and initial database transfer.
+    - `WAIT` implementation
+    - Partial `REPLCONF` implementation (to meet the tests)
 - [x] Persistence
+    - Hydration of basic K/V databases from disk.
+    - `KEYS` implementation
 - [x] Transactions
+    - `INCR` implementation
+    - `MULTI`/`EXEC`/`DISCARD` implementations
 - [x] Streams
+    - `TYPE` implementation
+    - Basic `XADD`/`XREAD`/`XRANGE` implementations, including id generation, validation and blocking.
+
+Implemented over the course of a few days, starting from near zero experience with Go.
 
 # Architectural Overview
 
@@ -34,8 +48,6 @@ The `internal/protocol` package implements methods to assist in reading/writing 
 
 Values are represented by the `rdb.ValueEntry` struct, which again is relatively brittle and is shared between data loading and runtime to simplify logic of hydrating databases.
 
-Implemented over the course of a few days, starting from near zero experience with Go.
-
 ## Todo list
 
 Todo list of things that pass the tests but aren't fully fleshed out.
@@ -46,3 +58,5 @@ Todo list of things that pass the tests but aren't fully fleshed out.
 - Eliminate remaining special casing of commands which were glossed over in codecrafters, e.g. the other REPLCONF commands issued during handshake.
 - Other commands/options that were elided as being not part of the codecrafters tests.
 - In-repo tests for the main server loop, replication, etc.
+- Implement partial database synchronisation and failover.
+- Implement writing database state to disk.
