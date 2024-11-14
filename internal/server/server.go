@@ -216,7 +216,7 @@ func NewServer(context context.Context, config Config) (*Server, error) {
 
 // A CommandRequest is a request to execute a command from a client.
 //
-// This is the struct used to communicate between the connection and replicator goroutines
+// This is the struct used to communicate between the connection and replication goroutines
 // and the executor goroutine.
 type CommandRequest struct {
 	// The handler to execute
@@ -275,7 +275,7 @@ func (s *Server) startExecutor() {
 			// Periodically check if any waiting commands can be resolved (timeout)
 			s.scanWaiters()
 
-		// Handle special messages from the replicator or followers
+		// Handle special messages from the replication or followers
 		// Note replicated commands are issued directly to the command channel
 		case msg := <-s.replicaCh:
 			// TODO: Review what other state needs to be updated
@@ -307,14 +307,15 @@ func (s *Server) startExecutor() {
 
 			// Assign the connection into the server state for the duration of the command.
 			// Hacky, but allows the command to get/set the correct offset.
-			// Proper solution would be to pass a separate connection metadata
-			// to Handler#Execute().
+			// Proper solution would be to pass a separate connection metadata to Handler#Execute().
+			// However this is only needed for the WAIT and REPLCONF ACK commands
 			s.currentConnection = req.conn
 
 			// Actually execute the handler on the server state.
 			err := req.handler.Execute(s, func(result string) {
 				// Responses are not sent to the Master for most messages.
-				// Negative IDs are used for the Master connection.
+				// Negative IDs are used to indicator the replication connection, which
+				// should only respond to REPLCONF commands.
 				if req.conn.id >= 0 || req.handler.Command().Name == "REPLCONF" {
 					req.conn.conn.Write([]byte(result))
 				}
@@ -322,14 +323,23 @@ func (s *Server) startExecutor() {
 
 			// Only increment the processed bytes count for replicated commands.
 			// Also update for all commands issued via replication (id == -1).
+			// CORRECTNESS: This doesn't mirror the sending code above (which can never send
+			// a non-replicated command to a replica). However this check was needed to pass
+			// the tests, which sends a PING to a replica. This divergence would disappear
+			// given cohesive logic for what is sent to replicas and when.
 			if isReplicatedCommand || req.conn.id == -1 {
 				s.replication.masterReplOffset += req.commandBytes
 			}
 
 			// Store the new replication offset in the connection metadata
-			// This tracks the latest offset that the client has given us, so we know
+			// This tracks the latest offset that the client has issued commands at, so we know
 			// which offset to check for on the replicas should the client issue a WAIT.
-			s.currentConnection.replOffset.Store(int64(s.replication.masterReplOffset))
+			//
+			// This is only done for non-replica connections, as replicas will be updated by
+			// receiving an explicit REPLCONF ACK, and is stored in the same field.
+			if !s.currentConnection.isReplica {
+				s.currentConnection.replOffset.Store(int64(s.replication.masterReplOffset))
+			}
 
 			if err != nil {
 				log.Printf("[%s] Got error executing command `%#v`", req.conn.addr, err)
@@ -341,19 +351,19 @@ func (s *Server) startExecutor() {
 	}
 }
 
-// Start the replicator goroutine, which will handle all replication tasks.
+// Start the replication goroutine, which will handle all replication tasks.
 // This connects to the master and listens for commands, forwarding them to the executor.
-func (s *Server) startReplicator() {
+func (s *Server) runReplication() {
 	parts := strings.Split(s.config.ReplicaOf, " ")
 
 	if len(parts) != 2 {
-		log.Fatalf("[replicator] replicaof must be of form '<HOST> <PORT>', got '%s'", s.config.ReplicaOf)
+		log.Fatalf("[replication] replicaof must be of form '<HOST> <PORT>', got '%s'", s.config.ReplicaOf)
 	}
 
 	conn, err := net.Dial("tcp", strings.Join(parts, ":"))
 
 	if err != nil {
-		log.Fatalf("[replicator] Got error connecting to master %#v", err)
+		log.Fatalf("[replication] Got error connecting to master %#v", err)
 	}
 
 	reader := bufio.NewReader(conn)
@@ -365,7 +375,7 @@ func (s *Server) startReplicator() {
 	resp, _, _ := protocol.ReadString(reader)
 
 	if resp != "PONG" {
-		log.Fatalf("[replicator] Expected PONG in response to PING, got %s", resp)
+		log.Fatalf("[replication] Expected PONG in response to PING, got %s", resp)
 	}
 
 	// Handshake part 2
@@ -376,7 +386,7 @@ func (s *Server) startReplicator() {
 	})))
 	resp, _, _ = protocol.ReadString(reader)
 	if resp != "OK" {
-		log.Fatalf("[replicator] Expected OK in response to REPLCONF, got %s", resp)
+		log.Fatalf("[replication] Expected OK in response to REPLCONF, got %s", resp)
 	}
 
 	conn.Write([]byte(protocol.EncodeArray([]string{
@@ -384,7 +394,7 @@ func (s *Server) startReplicator() {
 	})))
 	resp, _, _ = protocol.ReadString(reader)
 	if resp != "OK" {
-		log.Fatalf("[replicator] Expected OK in response to REPLCONF, got %s", resp)
+		log.Fatalf("[replication] Expected OK in response to REPLCONF, got %s", resp)
 	}
 
 	// Handshake part 3
@@ -393,7 +403,7 @@ func (s *Server) startReplicator() {
 	conn.Write([]byte(protocol.EncodeArray([]string{"PSYNC", "?", "-1"})))
 	resp, _, _ = protocol.ReadString(reader)
 
-	log.Printf("[replicator] Got PSYNC response: %s", resp)
+	log.Printf("[replication] Got PSYNC response: %s", resp)
 
 	dbfile, _ := protocol.ReadBytes(reader)
 
@@ -424,15 +434,15 @@ func (s *Server) startReplicator() {
 			cmd, bytesRead, err := receiveCommand(reader)
 
 			if err == io.EOF {
-				log.Print("[replicator] Master disconnected, terminating replicator.")
+				log.Print("[replication] Master disconnected, terminating replication.")
 				return
 			} else if err != nil {
-				log.Fatalf("[replicator] Got error reading from master %#v", err)
+				log.Fatalf("[replication] Got error reading from master %#v", err)
 			} else {
 				handler, err := cmd.Handler()
 
 				if err != nil {
-					log.Printf("[replicator] Got error getting handler for command `%#v` from master", err)
+					log.Printf("[replication] Got error getting handler for command `%#v` from master", err)
 					result := protocol.EncodeError(err.Error())
 					conn.Write([]byte(result))
 				}
@@ -457,7 +467,7 @@ func (s *Server) Start() {
 
 	go s.startExecutor()
 	if s.replication.role == "slave" {
-		go s.startReplicator()
+		go s.runReplication()
 	}
 
 	// Accept connections in a loop, spawning goroutines for each.
@@ -483,20 +493,39 @@ func (s *Server) Start() {
 	}
 }
 
+// A Connection represents a connection between client and server.
 type Connection struct {
+	// Id will be a positive integer for normal client to server connections.
+	// For the special case of connection from server to master, id will be -1.
 	id   int
 	conn net.Conn
 	addr string
 
+	// Buffering state for MULTI/EXEC transactions. This is done at the connection level,
+	// in order to isolate and remove the need for the executor goroutine to handle this state.
 	isBuffering bool
 	buffer      []commands.Handler
 	bufferBytes int
 
+	// Replication offset for this connection. This is used to track the latest offset that
+	// the client has issued commands at, in order to know which offset to WAIT for on replicas.
+	//
+	// This field is dual purpose, as when Connection represents a replica link, it is used to
+	// store the latest offset that the replica has ack'd to the master.
 	replOffset *atomic.Int64
 
+	// Whether this connection is a replica link (a connection from a replica to the master)
 	isReplica bool
 }
 
+// Clear the buffer of commands for this connection, resetting the state to non-buffering.
+func (c *Connection) clearBuffer() {
+	c.buffer = []commands.Handler{}
+	c.isBuffering = false
+	c.bufferBytes = 0
+}
+
+// Read a full command from the reader, returning the command and the number of bytes read.
 func receiveCommand(reader *bufio.Reader) (*commands.Command, int, error) {
 	// Peek the first character to determine the datatype being sent
 	c, err := reader.Peek(1)
@@ -538,18 +567,8 @@ func receiveCommand(reader *bufio.Reader) (*commands.Command, int, error) {
 	return &command, bytesRead, nil
 }
 
-func checkReadError(err error, addr string) bool {
-	if err == io.EOF {
-		log.Printf("[%s] Disconnected", addr)
-		return true
-	} else if err != nil {
-		log.Printf("[%s] Got error reading client command `%#v`", addr, err)
-		return true
-	}
-
-	return false
-}
-
+// Handle a connection from a client, reading commands from the client and sending them
+// to the executor. Must be run in a separate goroutine.
 func handleConnection(s *Server, conn net.Conn, connId int) {
 	defer conn.Close()
 
@@ -576,8 +595,12 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 		default:
 			command, commandBytes, err := receiveCommand(reader)
 
-			if checkReadError(err, connState.addr) {
+			if err == io.EOF {
+				log.Printf("[%s] Disconnected", connState.addr)
 				return
+			} else if err != nil {
+				log.Printf("[%s] Got error reading client command `%#v`", connState.addr, err)
+				continue
 			}
 
 			// Meta commands for Replication
@@ -616,9 +639,7 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 					return
 				}
 
-				connState.buffer = []commands.Handler{}
-				connState.isBuffering = false
-				connState.bufferBytes = 0
+				connState.clearBuffer()
 				conn.Write([]byte(protocol.EncodeString("OK")))
 			} else if command.Name == "EXEC" {
 				if !connState.isBuffering {
@@ -633,13 +654,11 @@ func handleConnection(s *Server, conn net.Conn, connId int) {
 					commandBytes: connState.bufferBytes,
 				}
 
-				// Assumption: Don't need to Wait here, as grouped commands do not block.
+				// No need to Wait on the handler here, as grouped commands do not block.
 				// Semantically this is correct, as within an EXEC no other commands can be interleaved,
 				// so blocking cannot possibly receive new data.
 
-				connState.buffer = []commands.Handler{}
-				connState.isBuffering = false
-				connState.bufferBytes = 0
+				connState.clearBuffer()
 			} else {
 				// Otherwise just find handlers as we receive, and either buffer or send to the executor
 				log.Printf("[%s] Received command %s", connState.addr, command.Name)

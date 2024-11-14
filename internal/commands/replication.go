@@ -56,20 +56,15 @@ func (h *WaitHandler) Execute(state domain.State, reply func(string)) error {
 	if replicaCount >= h.numReplicas {
 		reply(protocol.EncodeInteger(replicaCount))
 		h.wg.Done()
-		return nil
+	} else {
+		// Otherwise wait for more replicas, blocking the client until we respond.
+		state.WaitForReplicas(connOffset, h.numReplicas, h.timeout, func(count int) {
+			reply(protocol.EncodeInteger(count))
+			h.wg.Done()
+		})
 	}
 
-	// Otherwise wait for more replicas
-	state.WaitForReplicas(connOffset, h.numReplicas, h.timeout, func(count int) {
-		reply(protocol.EncodeInteger(count))
-		h.wg.Done()
-	})
-
 	return nil
-
-	// connectedSlaves, _ := state.ReplicationInfo().GetInt("connectedSlaves")
-	// reply(protocol.EncodeInteger(connectedSlaves))
-	// return nil
 }
 
 func (h *WaitHandler) Mutability() CommandMutability {

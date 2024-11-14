@@ -12,20 +12,37 @@ event loops, the Redis protocol and more.
 
 # Status
 
-For the given codecrafters course sections
+For the given codecrafters course sections.
 
 - [x] Basics
-- [ ] Replication
+- [x] Replication
 - [x] Persistence
 - [x] Transactions
 - [x] Streams
 
-# Todo list
+# Architectural Overview
+
+This server has been structured to use three distinct classes of goroutine.
+
+- The executor goroutine, a singleton which manages the main loop of executing and responding to commands.
+- The replication goroutine, an optional singleton which connects to a master and passes replication state to the executor goroutine.
+- Connection goroutines, which are spawned for each connection to the server, including connections from replicas. These handle initial command parsing and transactions, and then pass off to the main executor goroutine via a channel.
+
+Commands are implemented a generic `Command` struct, which is then wrapped by a `Handler` struct which is constructed and validates the arguments for that command. The API between `Handler` and state is defined in `internal/domain` as the `State` interface.
+
+The `internal/protocol` package implements methods to assist in reading/writing RESP 2.0 messages. The `internal/rdb` package implements the persistence loading, and is likely the most brittle part as it has only just enough to pass the codecrafters test suites.
+
+Values are represented by the `rdb.ValueEntry` struct, which again is relatively brittle and is shared between data loading and runtime to simplify logic of hydrating databases.
+
+Implemented over the course of a few days, starting from near zero experience with Go.
+
+## Todo list
 
 Todo list of things that pass the tests but aren't fully fleshed out.
 
-- Locking for EXEC should be done at the top level rather than per-command.
-- Implement a reaper goroutine and channel that handles removing expired keys. Each conn can send new expiries to it via a channel, and it can track the queue of expiries itself.
-- Checking of validity for command arguments etc is very slapdash.
-- Error handling elided in various places.
-- `processCommand` could do with breaking into pieces and refactoring.
+- Improve performance of key expiry. Currently all keys are scanned periodically.
+- Eliminate any places error handling was elided during implementation.
+- The connection replOffset passing to allow WAIT/REPLCONF ACK to work is currently very brittle. Rework to add an explicit connection state to be passed into Handlers?
+- Eliminate remaining special casing of commands which were glossed over in codecrafters, e.g. the other REPLCONF commands issued during handshake.
+- Other commands/options that were elided as being not part of the codecrafters tests.
+- In-repo tests for the main server loop, replication, etc.
