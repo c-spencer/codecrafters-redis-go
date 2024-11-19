@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -51,13 +50,13 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 	parts := strings.Split(s.config.ReplicaOf, " ")
 
 	if len(parts) != 2 {
-		log.Fatalf("[replication] replicaof must be of form '<HOST> <PORT>', got '%s'", s.config.ReplicaOf)
+		s.logger.Fatal().Msgf("[replication] replicaof must be of form '<HOST> <PORT>', got '%s'", s.config.ReplicaOf)
 	}
 
 	conn, err := net.Dial("tcp", strings.Join(parts, ":"))
 
 	if err != nil {
-		log.Fatalf("[replication] Got error connecting to master %#v", err)
+		s.logger.Fatal().Msgf("[replication] Got error connecting to master %#v", err)
 	}
 
 	reader := bufio.NewReader(conn)
@@ -69,7 +68,7 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 	resp, _, _ := protocol.ReadString(reader)
 
 	if resp != "PONG" {
-		log.Fatalf("[replication] Expected PONG in response to PING, got %s", resp)
+		s.logger.Fatal().Msgf("[replication] Expected PONG in response to PING, got %s", resp)
 	}
 
 	// Handshake part 2
@@ -80,7 +79,7 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 	})))
 	resp, _, _ = protocol.ReadString(reader)
 	if resp != "OK" {
-		log.Fatalf("[replication] Expected OK in response to REPLCONF, got %s", resp)
+		s.logger.Fatal().Msgf("[replication] Expected OK in response to REPLCONF, got %s", resp)
 	}
 
 	conn.Write([]byte(protocol.EncodeArray([]string{
@@ -88,7 +87,7 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 	})))
 	resp, _, _ = protocol.ReadString(reader)
 	if resp != "OK" {
-		log.Fatalf("[replication] Expected OK in response to REPLCONF, got %s", resp)
+		s.logger.Fatal().Msgf("[replication] Expected OK in response to REPLCONF, got %s", resp)
 	}
 
 	// Handshake part 3
@@ -97,11 +96,11 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 	conn.Write([]byte(protocol.EncodeArray([]string{"PSYNC", "?", "-1"})))
 	resp, _, _ = protocol.ReadString(reader)
 
-	log.Printf("[replication] Got PSYNC response: %s", resp)
+	s.logger.Debug().Msgf("[replication] Got PSYNC response: %s", resp)
 
 	dbfile, _ := protocol.ReadBytes(reader)
 
-	log.Printf("Received dbfile of length %d", len(dbfile))
+	s.logger.Info().Msgf("[replication] Synchronised dbfile of length %d from master, hydrating", len(dbfile))
 
 	db, err := rdb.LoadDatabaseFromReader(bytes.NewReader(dbfile))
 	if err == nil {
@@ -109,6 +108,8 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 			messageType: "db",
 			payload:     db.Hashtable,
 		}
+	} else {
+		s.logger.Fatal().Msgf("[replication] Error loading database from master: %s", err)
 	}
 
 	connState := Connection{
@@ -132,17 +133,17 @@ func (s *ExecutorState) runReplication(wg *sync.WaitGroup) {
 					// Timeout is expected, yielding to check for graceful shutdown.
 					continue
 				} else if err == io.EOF {
-					log.Print("[replication] Master disconnected, terminating replication.")
+					s.logger.Warn().Msg("[replication] Master disconnected, terminating replication.")
 					return
 				} else {
-					log.Fatalf("[replication] Got error reading from master %#v", err)
+					s.logger.Fatal().Msgf("[replication] Got error reading from master %#v", err)
 				}
 			}
 
 			handler, err := cmd.Handler()
 
 			if err != nil {
-				log.Printf("[replication] Got error getting handler for command `%#v` from master", err)
+				s.logger.Error().Msgf("[replication] Got error getting handler for command `%#v` from master", err)
 				result := protocol.EncodeError(err.Error())
 				conn.Write([]byte(result))
 			}

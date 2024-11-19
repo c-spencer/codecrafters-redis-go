@@ -2,7 +2,6 @@ package commands
 
 import (
 	"errors"
-	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -155,7 +154,6 @@ func NewReplConfAckHandler(cmd *Command) (Handler, error) {
 }
 
 func (h *ReplConfAckHandler) Execute(state domain.State, reply func(string)) error {
-	log.Printf("Received REPLCONF ACK %d", h.offset)
 	state.SetConnectionOffset(h.offset)
 	return nil
 }

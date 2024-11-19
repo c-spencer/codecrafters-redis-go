@@ -3,10 +3,11 @@ package server
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -81,7 +82,7 @@ func (cfg *Config) Validate() error {
 	return nil
 }
 
-func ReadConfig() Config {
+func ReadConfig(logger zerolog.Logger) Config {
 	// Receive, parse and validate the configuration
 	dir := flag.String("dir", defaultDir, "Directory for database files")
 	dbfilename := flag.String("dbfilename", defaultDBFilename, "Database filename")
@@ -98,7 +99,7 @@ func ReadConfig() Config {
 	}
 
 	if err := config.Validate(); err != nil {
-		log.Fatalf("Configuration error: %v", err)
+		logger.Fatal().Msgf("Configuration error: %v", err)
 	}
 
 	return config

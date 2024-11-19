@@ -3,7 +3,6 @@ package commands
 import (
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/codecrafters-io/redis-starter-go/internal/domain"
@@ -48,8 +47,7 @@ func NewExecHandler(handlers []Handler) Handler {
 }
 
 func (h *ExecHandler) Command() *Command {
-	log.Fatalf("ExecHandler.Command() not implemented")
-	return nil
+	panic("ExecHandler.Command() not yet implemented")
 }
 func (h *ExecHandler) Wait() {}
 

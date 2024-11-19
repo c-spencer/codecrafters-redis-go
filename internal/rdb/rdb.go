@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -202,8 +201,6 @@ func readMetadata(reader *bufio.Reader) map[string]string {
 		value := readString(reader)
 
 		metadata[name] = value
-
-		log.Printf("%s = %s", name, value)
 	}
 
 	return metadata

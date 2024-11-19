@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path"
@@ -20,6 +19,7 @@ import (
 	"github.com/codecrafters-io/redis-starter-go/internal/domain"
 	"github.com/codecrafters-io/redis-starter-go/internal/protocol"
 	"github.com/codecrafters-io/redis-starter-go/internal/rdb"
+	"github.com/rs/zerolog"
 )
 
 // The main ExecutorState state, holding all data and connections.
@@ -34,7 +34,8 @@ type ExecutorState struct {
 	replicas          map[int]*Connection
 	currentConnection *Connection
 
-	ctx context.Context
+	ctx    context.Context
+	logger zerolog.Logger
 
 	commandCh chan CommandRequest
 
@@ -171,7 +172,7 @@ func (s *ExecutorState) ConnectionOffset() int {
 	if s.currentConnection != nil {
 		return int(s.currentConnection.replOffset.Load())
 	} else {
-		log.Printf("WARN ConnectionOffset called outside of a command context")
+		s.logger.Warn().Msgf("ConnectionOffset called outside of a command context")
 		return 0
 	}
 }
@@ -179,7 +180,7 @@ func (s *ExecutorState) SetConnectionOffset(offset int) {
 	if s.currentConnection != nil {
 		s.currentConnection.replOffset.Store(int64(offset))
 	} else {
-		log.Printf("WARN SetConnectionOffset called outside of a command context")
+		s.logger.Warn().Msgf("SetConnectionOffset called outside of a command context")
 	}
 }
 
@@ -205,7 +206,7 @@ func (s *ExecutorState) scanWaiters() {
 // Main entrypoint, starts a new server instance from the given context and Config, consisting of
 // a set of goroutines. Will terminate when the context is cancelled, and returns a WaitGroup that
 // can be used to wait for the server to shut down.
-func RunServer(context context.Context, config Config) (*sync.WaitGroup, error) {
+func RunServer(context context.Context, logger zerolog.Logger, config Config) (*sync.WaitGroup, error) {
 	replicationState := ReplicationState{
 		role:             "master",
 		masterReplid:     "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
@@ -223,6 +224,7 @@ func RunServer(context context.Context, config Config) (*sync.WaitGroup, error) 
 		replication:   replicationState,
 		replicas:      make(map[int]*Connection),
 		ctx:           context,
+		logger:        logger,
 		commandCh:     make(chan CommandRequest),
 		replicaCh:     make(chan ReplicationMessage),
 		subscriptions: []Subscription{},
@@ -264,7 +266,7 @@ func (s *ExecutorState) runExecutor(wg *sync.WaitGroup) {
 		select {
 		// Graceful shutdown
 		case <-s.ctx.Done():
-			log.Printf("Shutting down command executor")
+			s.logger.Info().Msg("Shutting down command executor")
 			return
 
 		// Regular book-keeping tasks
@@ -289,7 +291,7 @@ func (s *ExecutorState) runExecutor(wg *sync.WaitGroup) {
 				for _, replica := range s.replicas {
 					_, err := replica.conn.Write(getAck)
 					if err != nil {
-						log.Printf("Got error polling replica %d: %#v", replica.id, err)
+						s.logger.Error().Msgf("Got error polling replica %d: %#v", replica.id, err)
 					}
 				}
 
@@ -366,7 +368,7 @@ func (s *ExecutorState) runExecutor(wg *sync.WaitGroup) {
 			}
 
 			if err != nil {
-				log.Printf("[%s] Got error executing command `%#v`", req.conn.addr, err)
+				s.logger.Error().Msgf("[%s] Got error executing command `%s`", req.conn.addr, err)
 				req.conn.conn.Write([]byte(protocol.EncodeError(err.Error())))
 			}
 
@@ -381,7 +383,7 @@ func (s *ExecutorState) runAcceptLoop(wg *sync.WaitGroup) {
 
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", s.config.Port))
 	if err != nil {
-		log.Fatalf("Failed to bind to port %s: %v", s.config.Port, err)
+		s.logger.Fatal().Msgf("Failed to bind to port %s: %v", s.config.Port, err)
 	}
 	defer l.Close()
 
@@ -393,7 +395,7 @@ func (s *ExecutorState) runAcceptLoop(wg *sync.WaitGroup) {
 
 		select {
 		case <-s.ctx.Done():
-			log.Println("Refusing new connections")
+			s.logger.Info().Msg("Refusing new connections")
 			return
 		default:
 			conn, err := l.Accept()
@@ -402,7 +404,7 @@ func (s *ExecutorState) runAcceptLoop(wg *sync.WaitGroup) {
 					// Timeout is expected, yielding to check for graceful shutdown.
 					continue
 				}
-				log.Println("Error accepting connection: ", err.Error())
+				s.logger.Error().Msgf("Error accepting connection: %s", err)
 				os.Exit(1)
 			}
 
@@ -489,7 +491,7 @@ func handleConnection(s *ExecutorState, conn net.Conn, connId int) {
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("Closing connection %d", connState.id)
+			s.logger.Debug().Msgf("Closing connection %d", connState.id)
 			return
 		default:
 			command, commandBytes, err := receiveCommand(conn, reader)
@@ -499,10 +501,10 @@ func handleConnection(s *ExecutorState, conn net.Conn, connId int) {
 					// Timeout is expected, yielding to check for graceful shutdown.
 					continue
 				} else if err == io.EOF || strings.Contains(err.Error(), "connection reset by peer") {
-					log.Printf("[%s] Disconnected", connState.addr)
+					s.logger.Info().Msgf("[%s] Disconnected", connState.addr)
 					return
 				} else {
-					log.Printf("[%s] Got error reading client command `%#v` %s", connState.addr, err, err.Error())
+					s.logger.Error().Msgf("[%s] Got error reading client command `%#v` %s", connState.addr, err, err.Error())
 					continue
 				}
 			}
@@ -513,7 +515,7 @@ func handleConnection(s *ExecutorState, conn net.Conn, connId int) {
 				conn.Write([]byte(protocol.EncodeString("OK")))
 			} else if command.Name == "PSYNC" {
 				if len(command.Arguments) < 2 || command.Arguments[0] != "?" || command.Arguments[1] != "-1" {
-					log.Printf("Got unexpected PSYNC arguments: %#v", command.Arguments)
+					s.logger.Error().Msgf("Got unexpected PSYNC arguments: %#v", command.Arguments)
 					conn.Write([]byte(protocol.EncodeError("Unexpected PSYNC arguments")))
 				} else {
 					conn.Write([]byte(protocol.EncodeString(
@@ -565,12 +567,12 @@ func handleConnection(s *ExecutorState, conn net.Conn, connId int) {
 				connState.clearBuffer()
 			} else {
 				// Otherwise just find handlers as we receive, and either buffer or send to the executor
-				log.Printf("[%s] Received command %s", connState.addr, command.Name)
+				s.logger.Info().Msgf("[%s] Received command %s", connState.addr, command.Name)
 
 				handler, err := command.Handler()
 
 				if err != nil {
-					log.Printf("[%s] Got error getting handler for command `%#v`", connState.addr, err)
+					s.logger.Error().Msgf("[%s] Got error getting handler for command `%#v`", connState.addr, err)
 					result := protocol.EncodeError(err.Error())
 					conn.Write([]byte(result))
 				}
