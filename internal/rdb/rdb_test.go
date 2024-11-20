@@ -3,6 +3,7 @@ package rdb
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"testing"
 )
 
@@ -27,8 +28,10 @@ func TestReadString(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := bufio.NewReader(bytes.NewReader(tt.input))
-			result := readString(reader)
-			if result != tt.expected {
+			result, err := readString(reader)
+			if err != nil {
+				t.Error(err)
+			} else if result != tt.expected {
 				t.Errorf("readSize() = %v, want %v", result, tt.expected)
 			}
 		})
@@ -83,10 +86,29 @@ func TestReadSize(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reader := bufio.NewReader(bytes.NewReader(tt.input))
-			result, isString := readSize(reader)
-			if result != tt.expected || isString != tt.isString {
+			result, isString, err := readSize(reader)
+			if err != nil {
+				t.Error(err)
+			} else if result != tt.expected || isString != tt.isString {
 				t.Errorf("readSize() = %v (%t), want %v (%t)", result, isString, tt.expected, tt.isString)
 			}
 		})
 	}
+}
+
+func FuzzLoadDatabaseFromReader(f *testing.F) {
+	// Give an empty database as a seed
+	emptyDb, err := hex.DecodeString(EmptyHexDatabase)
+	if err != nil {
+		f.Fatalf("Failed to decode empty database: %v", err)
+	}
+	f.Add(emptyDb)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		reader := bufio.NewReader(bytes.NewReader(data))
+		_, err := LoadDatabaseFromReader(reader)
+		if err != nil {
+			t.Logf("Got error: %v", err)
+		}
+	})
 }

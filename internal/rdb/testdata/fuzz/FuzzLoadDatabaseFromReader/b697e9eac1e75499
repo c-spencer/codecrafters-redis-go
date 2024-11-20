@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("REDIS0000\xfa\xab\xc2\xfa0000\xfa")
